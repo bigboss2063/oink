@@ -23,6 +23,9 @@ use super::clipboard_hooks::ClipboardPortalHooks;
 use super::eis_inject::Injector;
 use super::runtime;
 
+/// Must match the installed `.desktop` basename (`com.hachiwii.oink.desktop`).
+const PORTAL_APP_ID: &str = "com.hachiwii.oink";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BarrierSide {
     Left,
@@ -142,6 +145,17 @@ impl PortalSessions {
     }
 
     async fn open_async() -> Result<(Opened, OwnedFd), InputError> {
+        // Host apps must Register before any other portal call so Plasma can
+        // show "Oink" instead of an unrecognized remote-control client.
+        match PORTAL_APP_ID.parse::<ashpd::AppID>() {
+            Ok(app_id) => {
+                if let Err(error) = ashpd::register_host_app(app_id).await {
+                    tracing::warn!(%error, "portal app_id 注册失败");
+                }
+            }
+            Err(error) => tracing::warn!(%error, "portal app_id 无效"),
+        }
+
         let input_capture = InputCapture::new()
             .await
             .map_err(|e| InputError::Platform(format!("InputCapture portal：{e}")))?;
