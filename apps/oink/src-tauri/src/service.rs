@@ -24,7 +24,7 @@ impl Startup {
     pub(crate) fn ready(&self) -> bool {
         matches!(*self.0.borrow(), Some(Ok(())))
     }
-    #[cfg(any(windows, test))]
+    #[cfg(any(windows, target_os = "linux", test))]
     pub(crate) fn finish(&self, result: Result<(), String>) {
         self.0.send_replace(Some(result));
     }
@@ -41,7 +41,7 @@ impl Startup {
         }
     }
 }
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 程序入口：按命令行参数选择服务进程、停止服务或界面。返回 `None` 表示运行界面。
@@ -70,7 +70,7 @@ pub fn dispatch_args() -> Option<ExitCode> {
                 }
             })
         }
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         SERVICE_ARG => {
             oink_agent::logs::init_service();
             Some(ExitCode::from(oink_agent::host::run_service()))
@@ -98,10 +98,11 @@ pub fn dispatch_args() -> Option<ExitCode> {
     }
 }
 
-/// Startup only; a Windows UI requests the SYSTEM launch broker exactly once.
-#[cfg(windows)]
+/// Startup only; Windows asks the SYSTEM launch broker, Linux detaches `--service`.
+#[cfg(any(windows, target_os = "linux"))]
 pub fn start_once(api: &RemoteApi, exe: &Path) -> Result<(), String> {
     let mut seen_owner = false;
+    #[cfg(windows)]
     let launched = match oink_agent::instance::is_running(api.data_dir()) {
         Some(true) => {
             seen_owner = true;
@@ -113,15 +114,41 @@ pub fn start_once(api: &RemoteApi, exe: &Path) -> Result<(), String> {
         ),
         None => return Err("backend_ownership_unavailable".into()),
     };
+    #[cfg(target_os = "linux")]
+    let mut launched = match oink_agent::instance::is_running(api.data_dir()) {
+        Some(true) => {
+            seen_owner = true;
+            None
+        }
+        Some(false) => Some(
+            oink_agent::backend::launch::spawn_detached(
+                std::process::Command::new(exe)
+                    .arg(SERVICE_ARG)
+                    .env("OINK_HOME", api.data_dir()),
+            )
+            .map_err(|e| format!("backend launch failed: {e}"))?,
+        ),
+        None => return Err("backend_ownership_unavailable".into()),
+    };
+    #[cfg(windows)]
     let _ = exe;
     let deadline = Instant::now() + START_TIMEOUT;
     loop {
+        #[cfg(windows)]
         if let Some(process) = &launched
             && let Some(code) = process
                 .exit_code()
                 .map_err(|e| format!("backend exit query failed: {e}"))?
         {
             return Err(format!("backend_exited:{code}"));
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(process) = &mut launched
+            && let Some(status) = process
+                .try_wait()
+                .map_err(|e| format!("backend exit query failed: {e}"))?
+        {
+            return Err(format!("backend_exited:{status}"));
         }
         // A live backend may still be retrying its endpoint publication after
         // Windows scanner denial. Keep reading the file while that owner lives;
@@ -142,8 +169,13 @@ pub fn start_once(api: &RemoteApi, exe: &Path) -> Result<(), String> {
         }
         api.reset_connections();
         match api.hello_with_timeout(Duration::from_millis(100)) {
+            #[cfg(windows)]
             Ok(info) if launched.as_ref().is_none_or(|process| process.id() == info.pid) => {
                 return validate_running_backend(api);
+            }
+            #[cfg(target_os = "linux")]
+            Ok(info) if launched.as_ref().is_none_or(|process| process.id() == info.pid) => {
+                return Ok(());
             }
             Ok(_) => {}
             Err(error) if api.build_mismatch() => return Err(error.to_string()),

@@ -7,7 +7,9 @@ use oink_agent::{
 };
 use tauri::{AppHandle, Manager};
 
-use crate::icon_render::{Appearance, Artwork, render};
+use crate::icon_render::Appearance;
+#[cfg(any(target_os = "macos", windows))]
+use crate::icon_render::{Artwork, render};
 
 #[derive(Default)]
 pub(crate) struct AppIcon {
@@ -18,6 +20,8 @@ pub(crate) struct AppIcon {
     windows: Mutex<std::collections::HashMap<String, platform::WindowIcons>>,
     #[cfg(windows)]
     tray: Mutex<Option<(Appearance, u32, oink_agent::tray::TrayLook)>>,
+    #[cfg(target_os = "linux")]
+    tray: Mutex<Option<Appearance>>,
 }
 
 #[derive(Default)]
@@ -109,6 +113,18 @@ pub(crate) fn refresh(app: &AppHandle) {
             prepare_window(app, window);
         }
     }
+    #[cfg(target_os = "linux")]
+    if let Some(tray) = app.tray_by_id("main") {
+        let state = app.state::<AppIcon>();
+        let appearance = state.settings.lock().unwrap().appearance();
+        let mut applied = state.tray.lock().unwrap();
+        if *applied != Some(appearance) {
+            match tray_image(app).and_then(|icon| tray.set_icon(Some(icon)).map_err(|e| e.to_string())) {
+                Ok(()) => *applied = Some(appearance),
+                Err(error) => tracing::warn!(%error, "could not update tray icon"),
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -142,6 +158,11 @@ pub(crate) fn tray_created(app: &AppHandle) {
     refresh(app);
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn tray_created(app: &AppHandle) {
+    refresh(app);
+}
+
 #[cfg(windows)]
 pub(crate) fn tray_image(app: &AppHandle) -> Result<tauri::image::Image<'static>, String> {
     let state = app.state::<AppIcon>();
@@ -151,6 +172,15 @@ pub(crate) fn tray_image(app: &AppHandle) -> Result<tauri::image::Image<'static>
     let look = settings.tray_presentation.look;
     drop(settings);
     let png = crate::icon_render::render_tray(look, appearance, platform::tray_size(app))?
+        .encode_png()
+        .map_err(|e| e.to_string())?;
+    tauri::image::Image::from_bytes(&png).map_err(|e| e.to_string())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn tray_image(app: &AppHandle) -> Result<tauri::image::Image<'static>, String> {
+    let appearance = app.state::<AppIcon>().settings.lock().unwrap().appearance();
+    let png = crate::icon_render::render_tray(oink_agent::tray::TrayLook::default(), appearance, 64)?
         .encode_png()
         .map_err(|e| e.to_string())?;
     tauri::image::Image::from_bytes(&png).map_err(|e| e.to_string())

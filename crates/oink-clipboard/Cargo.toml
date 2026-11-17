@@ -1,6 +1,6 @@
 [package]
 name = "oink-clipboard"
-description = "剪贴板：读写系统剪贴板（src/macos、src/windows）；同步逻辑（通用）"
+description = "剪贴板：读写系统剪贴板（src/macos、src/windows、src/linux）；同步逻辑（通用）"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -29,6 +29,9 @@ blake3 = "1"
 png = "0.18"
 # Native content transfers run on ordinary background tasks.
 tokio.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "6", default-features = false, features = ["tokio", "proxy"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"

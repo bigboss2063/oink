@@ -32,14 +32,24 @@ pub fn formats() -> dto::FormatSupport {
             .map(|name| RawValue::Text((*name).into()))
             .collect(),
     );
+    // Linux has no clipboard format namespace. It still has to name `win-cf`
+    // and HGLOBAL, because a Windows peer only releases CF_UNICODETEXT when the
+    // receiver's profile lists that native contract. Mac text stays on the
+    // portable UTF-8 path and does not consult these namespaces.
     let namespaces = if cfg!(target_os = "macos") {
         vec!["mac-uti"]
-    } else if cfg!(windows) {
+    } else if cfg!(windows) || cfg!(target_os = "linux") {
         vec!["win-name", "win-cf"]
     } else {
         vec![]
     };
-    let media = if cfg!(windows) { 0..9 } else { 0..1 };
+    let media = if cfg!(windows) {
+        0..9
+    } else if cfg!(target_os = "linux") {
+        0..2
+    } else {
+        0..1
+    };
     dto::FormatSupport::from_raw(
         [
             (1, portable.clone()),
@@ -175,6 +185,26 @@ mod tests {
         let no_text = profile(&["mime:image/png"], &["win-name"], &[0]);
         assert!(negotiated_selection(&mac, &no_text, &inventory, RepresentationId(1), ClipPlatform::Windows).is_err());
         assert!(negotiated_selection(&no_text, &win, &inventory, RepresentationId(1), ClipPlatform::Windows).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_profile_accepts_windows_unicode_text() {
+        use oink_foundation::content::{Medium, NativeFormat};
+        let mut inventory = crate::content::tests::fixture().inventory();
+        inventory.platform = ClipPlatform::Windows;
+        let text = inventory.items[0]
+            .representations
+            .iter_mut()
+            .find(|rep| rep.id == RepresentationId(1))
+            .unwrap();
+        text.format = NativeFormat::WindowsPredefined(13);
+        text.medium = Medium::HGlobal;
+        let linux = formats();
+        let windows = profile(PORTABLE_FORMATS, &["win-name", "win-cf"], &[0, 1, 2, 3, 4, 5, 6, 7, 8]);
+        assert!(negotiated_selection(&windows, &linux, &inventory, RepresentationId(1), ClipPlatform::Windows).is_ok());
+        let bare = profile(PORTABLE_FORMATS, &[], &[0]);
+        assert!(negotiated_selection(&windows, &bare, &inventory, RepresentationId(1), ClipPlatform::Windows).is_err());
     }
 }
 

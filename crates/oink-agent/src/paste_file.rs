@@ -43,6 +43,10 @@ pub fn language(value: UiLanguage) -> &'static str {
     }
     #[cfg(windows)]
     let system = preferred_language();
+    #[cfg(target_os = "linux")]
+    let system = crate::config::posix_languages().into_iter().next().unwrap_or_default();
+    #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
+    let system = String::new();
     match value.resolve(&system) {
         UiLanguage::SimplifiedChinese => "zh-Hans",
         UiLanguage::Japanese => "ja",

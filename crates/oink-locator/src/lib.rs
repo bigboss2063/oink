@@ -588,6 +588,7 @@ pub(crate) const DEFAULT_FRAME: Duration = Duration::from_micros(16_667);
 #[cfg(not(any(target_os = "macos", windows)))]
 mod platform {
     use super::*;
+    use crate::diagnostics::Health;
 
     pub(crate) fn available() -> bool {
         false
@@ -602,7 +603,7 @@ mod platform {
     pub(crate) struct Backend;
 
     impl Backend {
-        pub(crate) fn new() -> Option<Self> {
+        pub(crate) fn new(_: Arc<Health>) -> Option<Self> {
             None
         }
         pub(crate) fn set_displays(&mut self, _: &[DisplayInfo]) {}

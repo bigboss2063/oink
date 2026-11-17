@@ -856,6 +856,10 @@ fn system_language() -> String {
         .firstObject()
         .map_or_else(String::new, |s| s.to_string())
 }
+#[cfg(target_os = "linux")]
+fn system_language() -> String {
+    crate::config::posix_languages().into_iter().next().unwrap_or_default()
+}
 #[cfg(windows)]
 fn system_language() -> String {
     use windows::{

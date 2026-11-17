@@ -10,7 +10,9 @@ pub const REFERENCE_DIAGONAL_METERS: f64 = 0.686;
 ///
 /// **本机全局坐标**（`bounds` 所用坐标系）就是本机系统的光标坐标：
 /// - macOS：point，主屏左上角为原点，y 向下（Quartz 全局坐标）；
-/// - Windows：物理像素，虚拟桌面坐标（进程为 Per-Monitor-V2 DPI 感知）。
+/// - Windows：物理像素，虚拟桌面坐标（进程为 Per-Monitor-V2 DPI 感知）；
+/// - Linux（Wayland）：合成器逻辑坐标（`zxdg_output`），布局原点在左上、y 向下，
+///   与 InputCapture zones / libei 绝对位移一致。
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DisplayInfo {
     /// 稳定标识：重启、重新插拔后不变（macOS：显示器 UUID；Windows：显示器设备实例路径）。

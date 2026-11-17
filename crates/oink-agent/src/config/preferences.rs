@@ -103,6 +103,31 @@ impl UiLanguage {
     }
 }
 
+/// Preferred UI languages from the POSIX locale environment, as BCP-47-like tags.
+#[cfg(target_os = "linux")]
+pub fn posix_languages() -> Vec<String> {
+    parse_posix_languages(|key| std::env::var(key).ok())
+}
+
+/// The first variable naming a real locale wins; `C`/`POSIX` (any codeset) are skipped.
+#[cfg(any(target_os = "linux", test))]
+fn parse_posix_languages(var: impl Fn(&str) -> Option<String>) -> Vec<String> {
+    ["LANGUAGE", "LC_ALL", "LC_MESSAGES", "LANG"]
+        .into_iter()
+        .map(|key| {
+            var(key)
+                .unwrap_or_default()
+                .split(':')
+                .filter_map(|part| {
+                    let tag = part.split(['.', '@']).next().unwrap_or("").replace('_', "-");
+                    (!tag.is_empty() && tag != "C" && tag != "POSIX").then_some(tag)
+                })
+                .collect::<Vec<_>>()
+        })
+        .find(|tags| !tags.is_empty())
+        .unwrap_or_default()
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ThemeMode {
@@ -189,6 +214,22 @@ pub const DEFAULT_WINDOW_HEIGHT: u32 = 680;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn posix_languages_skip_c_locales_and_strip_codeset_and_modifier() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |key: &str| pairs.iter().find(|(k, _)| *k == key).map(|(_, v)| (*v).to_owned())
+        };
+        assert_eq!(
+            parse_posix_languages(env(&[("LANGUAGE", "zh_CN:en_US")])),
+            ["zh-CN", "en-US"]
+        );
+        assert_eq!(
+            parse_posix_languages(env(&[("LC_ALL", "C.UTF-8"), ("LANG", "ja_JP.UTF-8")])),
+            ["ja-JP"]
+        );
+        assert_eq!(parse_posix_languages(env(&[("LANG", "sr_RS@latin")])), ["sr-RS"]);
+        assert!(parse_posix_languages(env(&[("LANG", "POSIX")])).is_empty());
+    }
     #[test]
     fn bounds_and_platform_independent_defaults() {
         assert_eq!(LogMaxMb::default().get(), 1024);

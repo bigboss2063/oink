@@ -66,7 +66,7 @@ fn enqueue(app: &AppHandle, request: WindowRequest) {
                 WindowRequest::Normal(view, _, reply) => (*view, reply.take()),
                 WindowRequest::Panel(_) => (View::Panel, None),
             };
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "linux"))]
             let result = execute_request(&handle, request);
             #[cfg(target_os = "macos")]
             let result = {
@@ -172,7 +172,7 @@ pub fn shell_resize_panel(app: AppHandle, window: tauri::WebviewWindow, width: f
         };
         #[cfg(target_os = "macos")]
         crate::panel_macos::resize(&window, rect);
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         if let Some(panel) = app.get_webview_window("panel") {
             let _ = panel.set_size(tauri::PhysicalSize::new(rect.width, rect.height));
             let _ = panel.set_position(tauri::PhysicalPosition::new(rect.x, rect.y));
@@ -241,6 +241,14 @@ fn create_or_close_panel(app: &AppHandle, anchor: PanelAnchor) -> tauri::Result<
                 window.set_position(tauri::PhysicalPosition::new(rect.x, rect.y))?;
                 window.set_size(tauri::PhysicalSize::new(rect.width, rect.height))?;
                 show_windows(&window, OpenTrigger::Tray.activation())
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let _ = handle;
+                window.set_position(tauri::PhysicalPosition::new(rect.x, rect.y))?;
+                window.set_size(tauri::PhysicalSize::new(rect.width, rect.height))?;
+                window.show()?;
+                window.set_focus()
             }
         })
     });
@@ -319,23 +327,39 @@ fn create_normal(app: &AppHandle, view: View) -> tauri::Result<()> {
         };
         // The transparent gutter contains only the web silhouette's shadow.
         // Keep the actual product content at its original size/minimum.
-        let gutter = if view == View::Main { 24.0 } else { 0.0 };
+        // Linux keeps an opaque shell, so the gutter would read as an empty frame.
+        let gutter = if view == View::Main {
+            if cfg!(target_os = "linux") {
+                0.0
+            } else {
+                24.0
+            }
+        } else {
+            0.0
+        };
         let builder = builder(app, view)
             .inner_size(width + gutter * 2.0, height + gutter * 2.0)
             .center()
             .visible(false)
             .focused(false);
         let builder = if view == View::Main {
-            builder
+            let builder = builder
                 .min_inner_size(820.0 + gutter * 2.0, 560.0 + gutter * 2.0)
-                .visible(false)
-                // Tauri/Wry clears both the native backing and WebView backing
-                // (including WKWebView drawsBackground/underPageBackgroundColor).
-                // Disabling the system shadow avoids a rounded rectangle behind
-                // the CSS superellipse. About keeps its ordinary native frame.
+                .visible(false);
+            // Tauri/Wry clears both the native backing and WebView backing
+            // (including WKWebView drawsBackground/underPageBackgroundColor).
+            // Disabling the system shadow avoids a rounded rectangle behind
+            // the CSS superellipse. About keeps its ordinary native frame.
+            // WebKitGTK on Wayland still composites transparent surfaces as
+            // fully invisible, so Linux keeps an opaque frameless shell.
+            #[cfg(any(target_os = "macos", windows))]
+            let builder = builder
                 .transparent(true)
                 .background_color(tauri::window::Color(0, 0, 0, 0))
-                .shadow(false)
+                .shadow(false);
+            #[cfg(target_os = "linux")]
+            let builder = builder.decorations(false).shadow(false);
+            builder
         } else {
             builder
                 .resizable(false)
@@ -380,6 +404,8 @@ fn create_normal(app: &AppHandle, view: View) -> tauri::Result<()> {
             crate::main_window_macos::prepare(&window)?;
             crate::local_drop::attach(&window)?;
         }
+        #[cfg(target_os = "linux")]
+        let _ = window;
         // React first acknowledges committed DOM/theme and fonts. On macOS,
         // show_normal then waits for WebKit's native drawing barrier while the
         // window remains ordered out; hidden rAF is not a drawing barrier.
@@ -388,7 +414,7 @@ fn create_normal(app: &AppHandle, view: View) -> tauri::Result<()> {
         tracing::info!(view = label, "product window prepared");
         #[cfg(windows)]
         return finish_normal_windows(app, window, created, created && view == View::Main);
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
             let reveal = {
                 let shell = app.state::<Shell>();
@@ -491,8 +517,8 @@ fn show_normal(_app: &AppHandle, window: &tauri::WebviewWindow) -> tauri::Result
         let mtm = objc2::MainThreadMarker::new().expect("normal window on main thread");
         objc2_app_kit::NSApplication::sharedApplication(mtm).activate();
     }
-    #[cfg(not(windows))]
-    focus_window(window)?;
+    #[cfg(target_os = "linux")]
+    window.set_focus()?;
     tracing::info!(view = window.label(), "ready product window shown");
     crate::live_views::refresh(_app);
     Ok(())
@@ -518,23 +544,18 @@ fn show_windows(window: &tauri::WebviewWindow, activation: Activation) -> tauri:
 
 #[cfg(windows)]
 fn focus_window(window: &tauri::WebviewWindow) -> tauri::Result<()> {
-    #[cfg(windows)]
-    {
-        // Tao's set_focus falls back to injecting Alt down/up when Windows
-        // refuses foreground activation. Input sharing can forward those keys
-        // to another device. Respect the foreground policy without synthesizing
-        // input; a visible window remains available from the taskbar if denied.
-        let hwnd = windows::Win32::Foundation::HWND(window.hwnd()?.0);
-        // SAFETY: this is the live product HWND on its owning UI thread.
-        unsafe {
-            if !windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd).as_bool() {
-                tracing::warn!(view = window.label(), "Windows declined foreground activation");
-            }
+    // Tao's set_focus falls back to injecting Alt down/up when Windows
+    // refuses foreground activation. Input sharing can forward those keys
+    // to another device. Respect the foreground policy without synthesizing
+    // input; a visible window remains available from the taskbar if denied.
+    let hwnd = windows::Win32::Foundation::HWND(window.hwnd()?.0);
+    // SAFETY: this is the live product HWND on its owning UI thread.
+    unsafe {
+        if !windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd).as_bool() {
+            tracing::warn!(view = window.label(), "Windows declined foreground activation");
         }
-        Ok(())
     }
-    #[cfg(not(windows))]
-    window.set_focus()
+    Ok(())
 }
 
 pub fn sync_activation(app: &AppHandle) {

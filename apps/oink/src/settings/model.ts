@@ -86,7 +86,7 @@ export function usePreferences(): PrefsApi {
   const busy = useRef(false), queued = useRef<Prefs|null>(null), committed = useRef(prefs), latest = useRef(prefs);
   latest.current = prefs;
   const local = state.localPreferences;
-  const platform = state.boot?.platform === 'windows' ? 'win' : 'mac';
+  const platform = state.boot?.platform === 'windows' || state.boot?.platform === 'linux' ? 'win' : 'mac';
   useEffect(()=>{
     void api.group().then(group=>setTransform(group.members.find(m=>m.is_self)?.input_transform??null)).catch(()=>{});
     const refresh = () => {void Promise.allSettled([agent.query('launch',api.launchAtLoginStatus),agent.query('fileProvider',api.fileProviderStatus)]);};

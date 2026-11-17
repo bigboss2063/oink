@@ -10,6 +10,11 @@ pub fn preferred_languages() -> Vec<String> {
         .collect()
 }
 
+#[cfg(target_os = "linux")]
+pub fn preferred_languages() -> Vec<String> {
+    oink_agent::config::posix_languages()
+}
+
 #[cfg(windows)]
 pub fn preferred_languages() -> Vec<String> {
     use windows::{

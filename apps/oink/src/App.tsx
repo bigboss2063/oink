@@ -78,7 +78,9 @@ export function App() {
     const prefs = usePreferences();
     const view = new URLSearchParams(location.search).get('view') ?? 'main';
     const pairing = usePairing(view === 'main');
-    const platform = state.boot?.platform === 'windows' ? 'win' : 'mac';
+    // Linux reuses the Windows chrome (caption buttons + no traffic-light gutter).
+    const linuxShell = state.boot?.platform === 'linux';
+    const platform = state.boot?.platform === 'windows' || linuxShell ? 'win' : 'mac';
     const [controlTargets,setControlTargets]=useState<ReadonlyMap<string,ControlAction[]>>(()=>new Map());
     const [controls]=useState(()=>new ControlActions({
         read:(device,action)=>controlObservation(agent.get().cards,device,action),
@@ -220,14 +222,20 @@ export function App() {
             const window=getCurrentWindow();
             // macOS zoom keeps a floating shell; fullscreen and Windows
             // maximization fill the desktop without a gutter or corners.
-            const update=async()=>setMaximized(await window.isFullscreen() || (await window.isMaximized() && state.boot?.platform === 'windows'));
+            const update=async()=>{
+                try {
+                    setMaximized(await window.isFullscreen() || (await window.isMaximized() && platform === 'win'));
+                } catch {
+                    // Window ACL may be unavailable during early boot; keep the last known state.
+                }
+            };
             await update();
             const resized=await window.onResized(()=>{void update();});
             const focused=await window.onFocusChanged(event=>setWindowActive(event.payload));
             if(stopped){resized();focused();}else stops.push(resized,focused);
         });
         return()=>{stopped=true;stops.forEach(stop=>stop());};
-    },[state.boot?.platform]);
+    },[platform]);
 
     // Authoritative state replaces the present value, except while an operation runs:
     // its own echoes must not overwrite the checkpoint it may still restore.
@@ -239,8 +247,8 @@ export function App() {
         return observePanel(winEl);
     }, [view,winEl,self?.id,!!prefs.local]);
     useEffect(() => {
-        if (state.boot?.platform === 'windows' && prefs.local) void shell.setStatusIcon(prefs.local.show_status_icon).catch(() => agent.fail('unavailable'));
-    }, [state.boot?.platform,prefs.local?.show_status_icon]);
+        if ((state.boot?.platform === 'windows' || linuxShell) && prefs.local) void shell.setStatusIcon(prefs.local.show_status_icon).catch(() => agent.fail('unavailable'));
+    }, [state.boot?.platform,linuxShell,prefs.local?.show_status_icon]);
     useEffect(() => {if(prefs.local)void shell.setLogLevel(prefs.local.log_level).catch(()=>agent.fail('unavailable'));},[prefs.local?.log_level]);
     useEffect(() => {if(prefs.local)void shell.setLanguage(prefs.local.ui_language).catch(()=>agent.fail('unavailable'));},[prefs.local?.ui_language]);
     useEffect(() => {
@@ -734,7 +742,7 @@ export function App() {
     // oink-ui ships built-in component strings (default aria labels, key names)
     // in zh-CN and en-US only; Japanese and Korean use its English strings.
     return <OinkProvider locale={language === 'zh-Hans' ? 'zh-CN' : 'en-US'} defaultAccent={DEFAULT_ACCENT.value}>
-    <AppearanceSync local={prefs.local} presentation={prefs.presentation}/><div className="oink-app" data-package-drag={view==='main'&&packageDrag?'':undefined} data-view={view} data-platform={platform} data-edge-to-edge={maximized ? '' : undefined}>
+    <AppearanceSync local={prefs.local} presentation={prefs.presentation}/><div className="oink-app" data-package-drag={view==='main'&&packageDrag?'':undefined} data-view={view} data-platform={platform} data-edge-to-edge={maximized || linuxShell ? '' : undefined} data-linux={linuxShell ? '' : undefined}>
       {view === 'main' && <div className="win-shadow" aria-hidden="true"><div className="win-shadow__shape"/></div>}
       {body}{view === 'main' && !maximized && <ResizeEdges platform={platform}/>}{(view==='main'||view==='panel')&&!packageDrag&&<StatusNotices/>}
       {winEl && <>{!onboarding && <PairDialog pairing={pairing} container={winEl}/>}<BlockListDialog loading={state.blocked === null} pending={unblocking} error={blockError} open={blockedOpen} blocked={pairing.blocked} container={winEl} onClose={() => setBlockedOpen(false)} onRemove={p => { setBlockError(null); setUnblocking(ids => [...ids,p.id]); void pairing.actions.unblock(p).catch(() => setBlockError(problemText('unavailable'))).finally(() => setUnblocking(ids => ids.filter(id => id !== p.id))); }}/>

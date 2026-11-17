@@ -1,6 +1,6 @@
 [package]
 name = "oink-display"
-description = "屏幕与布局：枚举显示器（src/macos、src/windows）；布局模型、传送门、死区（通用）"
+description = "屏幕与布局：枚举显示器（src/macos、src/windows、src/linux）；布局模型、传送门、死区（通用）"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -22,6 +22,12 @@ block2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "block2", "NSArray", "NSDictionary", "NSGeometry", "NSNotification", "NSOperation", "NSString", "NSURL", "NSValue"] }
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSColor", "NSColorSpace", "NSGraphics", "NSScreen", "NSWorkspace", "objc2-core-foundation"] }
 objc2-image-io = { version = "0.3", default-features = false, features = ["std", "CGImageSource", "CGImageDestination", "objc2-core-graphics"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
+wayland-protocols-plasma = { version = "0.3", features = ["client"] }
 
 [target.'cfg(windows)'.dependencies]
 serde_json.workspace = true

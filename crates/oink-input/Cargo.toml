@@ -1,6 +1,6 @@
 [package]
 name = "oink-input"
-description = "采集与注入：截获本机键鼠/触摸板事件、向本机注入事件（src/macos、src/windows）"
+description = "采集与注入：截获本机键鼠/触摸板事件、向本机注入事件（src/macos、src/windows、src/linux）"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -14,6 +14,13 @@ thiserror.workspace = true
 tracing.workspace = true
 serde.workspace = true
 crossbeam-queue = "0.3"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# ashpd's remote_desktop module imports screencast::Stream even when we only use EIS.
+ashpd = { version = "0.14", default-features = false, features = ["tokio", "input_capture", "remote_desktop", "screencast"] }
+reis = { version = "0.7", features = ["tokio"] }
+futures-util = "0.3"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"

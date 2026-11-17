@@ -681,6 +681,24 @@ body:has(.oink-app:is([data-view="main"], [data-view="panel"])) { background: tr
 .win-shadow__shape { position: absolute; inset: var(--main-gutter); overflow: hidden; }
 .oink-app[data-view="main"][data-edge-to-edge] { --main-gutter: 0px; }
 .oink-app[data-edge-to-edge] > .win-shadow { display: none; }
+/* Linux keeps an opaque rectangular shell. Zero radius alone is not enough:
+   oink-ui's corner-shape fallback keeps a rounded clip-path from the prior
+   superellipse, so also pin --ok-shape and clear that clip. */
+.oink-app[data-linux] .win {
+  --win-r: 0px;
+  border-radius: 0;
+  corner-shape: round;
+  --ok-shape: round;
+  clip-path: none !important;
+  border-image: none !important;
+}
+.oink-app[data-linux] .win::after {
+  border-radius: 0;
+  corner-shape: round;
+  --ok-shape: round;
+  clip-path: none !important;
+  border-image: none !important;
+}
 .win-cap[data-snap-hover] { background: var(--ok-hover); }
 .resize-edges { position: absolute; inset: calc(var(--main-gutter) - 4px); pointer-events: none; z-index: 80; }
 .resize-edges > div { position: absolute; pointer-events: auto; }

@@ -1,6 +1,6 @@
 //! 采集与注入：截获本机键盘、鼠标、触摸板事件，把其他电脑发来的事件注入本机。
 //!
-//! - 对外只暴露 [`InputBackend`]；平台实现在 `src/macos`、`src/windows`，只做「翻译」，不做路由决策。
+//! - 对外只暴露 [`InputBackend`]；平台实现在 `src/macos`、`src/windows`、`src/linux`，只做「翻译」，不做路由决策。
 //! - Shared input event definitions live in `oink_foundation::input`.
 
 use std::sync::Arc;
@@ -35,6 +35,8 @@ pub mod diagnostics;
 pub mod display_power;
 pub mod gesture_trace;
 pub mod jitter;
+#[cfg(target_os = "linux")]
+mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 pub mod native_lifecycle;
@@ -72,8 +74,10 @@ pub use windows::raw_capture::dispatch_guard as dispatch_raw_clip_guard;
 #[cfg(windows)]
 pub use windows::service as windows_service;
 
-/// Pure native key tables are available on both OSes so an editor on either
+/// Pure native key tables are available on every OS so an editor on any
 /// device can validate a different source/target without guessing its key set.
+#[path = "linux/keymap.rs"]
+mod linux_keymap;
 #[path = "macos/keymap.rs"]
 pub mod mac_keymap;
 #[path = "windows/keymap.rs"]
@@ -83,6 +87,7 @@ pub fn native_key_supported(os: &str, code: KeyCode) -> bool {
     match os {
         "macos" => mac_keymap::hid_to_mac(code).is_some() || mac_keymap::hid_to_nx(code).is_some(),
         "windows" => win_keymap::lookup_hid(code).is_some(),
+        "linux" => linux_keymap::supported(code),
         _ => false,
     }
 }
@@ -442,6 +447,8 @@ pub fn platform_backend() -> Result<Box<dyn InputBackend>, InputError> {
     return macos::backend();
     #[cfg(windows)]
     return windows::backend();
+    #[cfg(target_os = "linux")]
+    return linux::backend();
     #[allow(unreachable_code)]
     Err(InputError::Unsupported)
 }

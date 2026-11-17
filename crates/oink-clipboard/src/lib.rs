@@ -1,6 +1,6 @@
 //! 剪贴板。
 //!
-//! - [`ClipboardBackend`]：读写本机系统剪贴板、监听变化。平台实现在 `src/macos`、`src/windows`。
+//! - [`ClipboardBackend`]：读写本机系统剪贴板、监听变化。平台实现在 `src/macos`、`src/windows`、`src/linux`。
 //! - [`sync`]：与平台无关的同步逻辑（通告、拉取、防回环、隐私标记透传）。
 
 // The AppKit harness compiles this crate with cfg(test) without libtest, whose
@@ -119,6 +119,8 @@ pub type FileReader = Box<dyn std::io::Read + Send>;
 pub mod copy_diagnostics;
 pub mod dnd;
 pub mod formats;
+#[cfg(target_os = "linux")]
+mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
@@ -362,8 +364,18 @@ pub fn platform_backend() -> Result<Box<dyn ClipboardBackend>, ClipboardError> {
     return macos::backend();
     #[cfg(windows)]
     return windows::backend();
+    #[cfg(target_os = "linux")]
+    return linux::backend();
     #[allow(unreachable_code)]
     Err(ClipboardError::Unsupported)
+}
+
+/// Linux has no clipboard format namespace of its own. Text is reconstructed
+/// with the Windows target: a Windows source keeps `CF_UNICODETEXT`, and Mac
+/// or unknown sources arrive as portable UTF-8.
+#[cfg(target_os = "linux")]
+pub fn reconstruction_target() -> oink_foundation::clipboard::ClipPlatform {
+    oink_foundation::clipboard::ClipPlatform::Windows
 }
 
 // Exercise the pure Windows bitmap codec on every development platform.

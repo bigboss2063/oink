@@ -51,19 +51,28 @@ pub struct KeyboardMapping {
 impl KeyboardMapping {
     pub fn preset(preset: KeyPreset, source_os: &str, target_os: &str) -> Self {
         use KeyCode as K;
-        let pairs: &[(KeyCode, KeyCode)] = match (preset, source_os, target_os) {
-            (KeyPreset::MacFeel, "macos", "windows") | (KeyPreset::MacFeel, "windows", "macos") => &[
-                (K::LEFT_CTRL, K::LEFT_GUI),
-                (K::LEFT_GUI, K::LEFT_CTRL),
-                (K::RIGHT_CTRL, K::RIGHT_GUI),
-                (K::RIGHT_GUI, K::RIGHT_CTRL),
-            ],
-            (KeyPreset::WinFeel, "macos", "windows") | (KeyPreset::WinFeel, "windows", "macos") => &[
-                (K::LEFT_ALT, K::LEFT_GUI),
-                (K::LEFT_GUI, K::LEFT_ALT),
-                (K::RIGHT_ALT, K::RIGHT_GUI),
-                (K::RIGHT_GUI, K::RIGHT_ALT),
-            ],
+        let pc = |os: &str| matches!(os, "windows" | "linux");
+        let pairs: &[(KeyCode, KeyCode)] = match preset {
+            KeyPreset::MacFeel
+                if (source_os == "macos" && pc(target_os)) || (pc(source_os) && target_os == "macos") =>
+            {
+                &[
+                    (K::LEFT_CTRL, K::LEFT_GUI),
+                    (K::LEFT_GUI, K::LEFT_CTRL),
+                    (K::RIGHT_CTRL, K::RIGHT_GUI),
+                    (K::RIGHT_GUI, K::RIGHT_CTRL),
+                ]
+            }
+            KeyPreset::WinFeel
+                if (source_os == "macos" && pc(target_os)) || (pc(source_os) && target_os == "macos") =>
+            {
+                &[
+                    (K::LEFT_ALT, K::LEFT_GUI),
+                    (K::LEFT_GUI, K::LEFT_ALT),
+                    (K::RIGHT_ALT, K::RIGHT_GUI),
+                    (K::RIGHT_GUI, K::RIGHT_ALT),
+                ]
+            }
             _ => &[],
         };
         Self {
@@ -76,7 +85,9 @@ impl KeyboardMapping {
     pub fn caps_tap_hold(&self, source_os: &str, target_os: &str, mac_caps_switch: bool) -> Option<CapsTapHold> {
         match self.preset {
             KeyPreset::Custom => self.caps_tap_hold,
-            KeyPreset::MacFeel if source_os == "macos" && target_os == "windows" && mac_caps_switch => {
+            KeyPreset::MacFeel
+                if source_os == "macos" && matches!(target_os, "windows" | "linux") && mac_caps_switch =>
+            {
                 Some(CapsTapHold {
                     tap: KeyCode::LEFT_SHIFT,
                     hold: KeyCode::CAPS_LOCK,
@@ -161,7 +172,7 @@ impl InputTransform {
         if source_os == "macos" {
             value.windows.keyboard = KeyboardMapping::preset(KeyPreset::MacFeel, source_os, "windows");
         }
-        if source_os == "windows" {
+        if matches!(source_os, "windows" | "linux") {
             value.macos.keyboard = KeyboardMapping::preset(KeyPreset::MacFeel, source_os, "macos");
         }
         value
@@ -169,7 +180,7 @@ impl InputTransform {
     pub fn resolve(&self, target: DeviceId, target_os: &str) -> TargetTransform {
         let mut value = match target_os {
             "macos" => self.macos.clone(),
-            "windows" => self.windows.clone(),
+            "windows" | "linux" => self.windows.clone(),
             _ => TargetTransform::default(),
         };
         if let Some(o) = self.overrides.iter().find(|o| o.target == target) {
@@ -319,6 +330,13 @@ mod tests {
         let win = KeyboardMapping::preset(KeyPreset::WinFeel, "windows", "macos");
         assert_eq!(win.map(KeyCode::RIGHT_ALT), KeyCode::RIGHT_GUI);
         assert_eq!(win.map(KeyCode::LEFT_CTRL), KeyCode::LEFT_CTRL);
+        let linux = InputTransform::initial("linux");
+        assert_eq!(linux.macos.keyboard.map(KeyCode::LEFT_CTRL), KeyCode::LEFT_GUI);
+        assert_eq!(
+            source.resolve(target, "linux").keyboard.map(KeyCode::LEFT_GUI),
+            KeyCode::LEFT_CTRL
+        );
+        assert!(source.resolve(target, "linux").reverse_wheel);
     }
     #[test]
     fn unknown_fields_are_ignored_and_duplicate_sources_rejected() {

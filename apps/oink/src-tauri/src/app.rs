@@ -2,7 +2,7 @@
 use std::sync::{Arc, Mutex};
 
 use oink_agent::api::{self, AgentApi, ApiError, ApiEvent, Reply, Request};
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Manager, State};
 
@@ -295,7 +295,7 @@ pub fn run() {
                 return;
             }
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
         {
             if let Err(error) = crate::service::check_backend_ownership(&data_dir) {
                 tracing::error!(%error, "backend process ownership unavailable");
@@ -325,7 +325,7 @@ pub fn run() {
             boot,
             update_window: Arc::new(crate::update_window::Owner::default()),
             update_follow: crate::update_window::Follow::default(),
-            startup: crate::service::Startup::new(cfg!(windows)),
+            startup: crate::service::Startup::new(cfg!(any(windows, target_os = "linux"))),
             remote: remote_api,
             capture: Mutex::new(Some(oink_agent::telemetry::UiCapture::new(
                 oink_foundation::paths::data_dir(),
@@ -416,6 +416,8 @@ pub fn run() {
                 crate::foreground_windows::install(&handle);
                 setup_tray(&handle)?;
             }
+            #[cfg(target_os = "linux")]
+            setup_tray(&handle)?;
             forward_events(&handle);
             crate::native_controls::initialize(&handle);
             #[cfg(windows)]
@@ -425,7 +427,7 @@ pub fn run() {
             if let Some(remote) = handle.state::<Backend>().remote.clone() {
                 let connected = handle.clone();
                 std::thread::spawn(move || {
-                    #[cfg(windows)]
+                    #[cfg(any(windows, target_os = "linux"))]
                     {
                         let result = std::env::current_exe().map_err(|e| e.to_string())
                             .and_then(|exe| crate::service::start_once(&remote, &exe));
@@ -623,14 +625,15 @@ fn show_main_on_main(app: &AppHandle) {
     crate::shell::open_normal(app, crate::shell_policy::View::Main);
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     let icon = crate::app_icon::tray_image(app).map_err(|error| tauri::Error::Io(std::io::Error::other(error)))?;
     TrayIconBuilder::with_id("main")
         .icon(icon)
         .tooltip("Oink")
-        .show_menu_on_left_click(false)
+        .show_menu_on_left_click(cfg!(target_os = "linux"))
         .build(app)?;
+    #[cfg(windows)]
     crate::tray_windows::install(app)?;
     crate::app_icon::tray_created(app);
     Ok(())
