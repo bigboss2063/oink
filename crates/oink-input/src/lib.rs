@@ -448,9 +448,21 @@ pub fn platform_backend() -> Result<Box<dyn InputBackend>, InputError> {
     #[cfg(windows)]
     return windows::backend();
     #[cfg(target_os = "linux")]
-    return linux::backend();
+    return linux::backend(None);
     #[allow(unreachable_code)]
     Err(InputError::Unsupported)
+}
+
+/// Linux input with optional clipboard portal hooks (RemoteDesktop lifetime).
+#[cfg(target_os = "linux")]
+pub use linux::ClipboardPortalHooks;
+
+/// Linux input wired to clipboard portal bind/unbind callbacks.
+#[cfg(target_os = "linux")]
+pub fn linux_backend(
+    clipboard: Option<std::sync::Arc<ClipboardPortalHooks>>,
+) -> Result<Box<dyn InputBackend>, InputError> {
+    linux::backend(clipboard)
 }
 
 #[cfg(any(windows, test))]

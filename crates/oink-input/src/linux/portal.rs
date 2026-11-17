@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ashpd::WindowIdentifier;
+use ashpd::desktop::clipboard::{Clipboard, RequestClipboardOptions};
 use ashpd::desktop::input_capture::{
     Barrier, Capabilities, ConnectToEISOptions as IcEisOptions, CreateSessionOptions as IcCreate, EnableOptions,
     GetZonesOptions, InputCapture, Region, ReleaseOptions, SetPointerBarriersOptions,
@@ -13,11 +14,12 @@ use ashpd::desktop::input_capture::{
 use ashpd::desktop::remote_desktop::{
     ConnectToEISOptions as RdEisOptions, DeviceType, RemoteDesktop, SelectDevicesOptions, StartOptions,
 };
-use ashpd::desktop::{CreateSessionOptions as RdCreate, PersistMode};
+use ashpd::desktop::{CreateSessionOptions as RdCreate, PersistMode, Session};
 use oink_foundation::{Point, Rect};
 
 use crate::InputError;
 
+use super::clipboard_hooks::ClipboardPortalHooks;
 use super::eis_inject::Injector;
 use super::runtime;
 
@@ -71,10 +73,12 @@ struct PortalGeometry {
 /// Live portal sessions required for capture and injection.
 pub(crate) struct PortalSessions {
     pub input_capture: InputCapture,
-    pub ic_session: ashpd::desktop::Session<InputCapture>,
+    pub ic_session: Session<InputCapture>,
     /// Owns the session behind the injection EIS connection.
     _remote_desktop: RemoteDesktop,
-    _rd_session: ashpd::desktop::Session<RemoteDesktop>,
+    /// Kept alive for EIS inject; clipboard attaches through [`ClipboardPortalHooks`].
+    _rd_session: Arc<Session<RemoteDesktop>>,
+    clipboard: Option<Arc<ClipboardPortalHooks>>,
     /// EIS fd from InputCapture (receiver); taken once by the capture thread.
     capture_eis: Mutex<Option<OwnedFd>>,
     activation_id: Mutex<Option<u32>>,
@@ -92,15 +96,16 @@ pub(crate) struct PortalSessions {
 
 struct Opened {
     input_capture: InputCapture,
-    ic_session: ashpd::desktop::Session<InputCapture>,
+    ic_session: Session<InputCapture>,
     remote_desktop: RemoteDesktop,
-    rd_session: ashpd::desktop::Session<RemoteDesktop>,
+    rd_session: Arc<Session<RemoteDesktop>>,
+    clipboard: Option<Clipboard>,
     capture_eis: OwnedFd,
     geometry: PortalGeometry,
 }
 
 impl PortalSessions {
-    pub(crate) fn open() -> Result<Arc<Self>, InputError> {
+    pub(crate) fn open(clipboard: Option<Arc<ClipboardPortalHooks>>) -> Result<Arc<Self>, InputError> {
         let (opened, inject_eis) = runtime::block_on(async { Self::open_async().await })?;
         let injector = Injector::start(inject_eis)?;
         let Opened {
@@ -108,14 +113,24 @@ impl PortalSessions {
             ic_session,
             remote_desktop,
             rd_session,
+            clipboard: clipboard_proxy,
             capture_eis,
             geometry,
         } = opened;
+        if let Some(hooks) = clipboard.as_ref() {
+            if let Some(proxy) = clipboard_proxy {
+                (hooks.bind)(proxy, Arc::clone(&rd_session));
+            } else {
+                (hooks.unbind)();
+                tracing::warn!("Clipboard portal 不可用（需要 Plasma 6.4+ 且 RequestClipboard 成功）");
+            }
+        }
         Ok(Arc::new(Self {
             input_capture,
             ic_session,
             _remote_desktop: remote_desktop,
             _rd_session: rd_session,
+            clipboard,
             capture_eis: Mutex::new(Some(capture_eis)),
             activation_id: Mutex::new(None),
             geometry: Mutex::new(geometry),
@@ -162,6 +177,20 @@ impl PortalSessions {
             )
             .await
             .map_err(|e| InputError::Platform(format!("选择 RemoteDesktop 设备失败：{e}")))?;
+        // Soft-fail: older portals (pre-Plasma 6.4) may lack Clipboard; input still works.
+        let clipboard_proxy = match Clipboard::new().await {
+            Ok(proxy) => match proxy.request(&rd_session, RequestClipboardOptions::default()).await {
+                Ok(()) => Some(proxy),
+                Err(error) => {
+                    tracing::warn!(%error, "RequestClipboard 失败；剪贴板 portal 不可用");
+                    None
+                }
+            },
+            Err(error) => {
+                tracing::warn!(%error, "Clipboard portal 不可用");
+                None
+            }
+        };
         let selected = remote_desktop
             .start(&rd_session, Option::<&WindowIdentifier>::None, StartOptions::default())
             .await
@@ -174,10 +203,16 @@ impl PortalSessions {
                 "RemoteDesktop 未授予完整键鼠设备：{devices:?}"
             )));
         }
+        // RequestClipboard success is enough: some portals omit clipboard_enabled.
+        if clipboard_proxy.is_some() && !selected.is_clipboard_enabled() {
+            tracing::debug!("Start 未报告 clipboard_enabled；仍按 RequestClipboard 成功绑定");
+        }
+        let clipboard = clipboard_proxy;
+        let rd_session = Arc::new(rd_session);
         // Inject over EIS rather than Notify*: KDE drops NotifyPointerMotionAbsolute
         // without a ScreenCast stream, and Notify* is rejected once EIS is connected.
         let inject_eis = remote_desktop
-            .connect_to_eis(&rd_session, RdEisOptions::default())
+            .connect_to_eis(rd_session.as_ref(), RdEisOptions::default())
             .await
             .map_err(|e| InputError::Platform(format!("RemoteDesktop ConnectToEIS 失败：{e}")))?;
         Ok((
@@ -186,6 +221,7 @@ impl PortalSessions {
                 ic_session,
                 remote_desktop,
                 rd_session,
+                clipboard,
                 capture_eis,
                 geometry,
             },
@@ -312,9 +348,17 @@ impl PortalSessions {
     }
 }
 
+impl Drop for PortalSessions {
+    fn drop(&mut self) {
+        if let Some(hooks) = self.clipboard.as_ref() {
+            (hooks.unbind)();
+        }
+    }
+}
+
 async fn configure_zones_and_barriers(
     input_capture: &InputCapture,
-    ic_session: &ashpd::desktop::Session<InputCapture>,
+    ic_session: &Session<InputCapture>,
 ) -> Result<PortalGeometry, InputError> {
     let zones = input_capture
         .zones(ic_session, GetZonesOptions::default())

@@ -17,7 +17,7 @@ crossbeam-queue = "0.3"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # ashpd's remote_desktop module imports screencast::Stream even when we only use EIS.
-ashpd = { version = "0.14", default-features = false, features = ["tokio", "input_capture", "remote_desktop", "screencast"] }
+ashpd = { version = "0.14", default-features = false, features = ["tokio", "input_capture", "remote_desktop", "screencast", "clipboard"] }
 reis = { version = "0.7", features = ["tokio"] }
 futures-util = "0.3"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }

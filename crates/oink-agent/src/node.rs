@@ -111,9 +111,33 @@ impl NodeOptions {
             oink_winsvc::backend::uiaccess()?,
             "Windows 后台需要 OinkInput 系统服务提供 UIAccess；请通过已安装的 Oink 打开"
         );
+        #[cfg(target_os = "linux")]
+        let (input, clipboard) = {
+            let slot = Arc::new(oink_clipboard::PortalClipboardSlot::new());
+            let hooks = Arc::new(oink_input::ClipboardPortalHooks {
+                bind: {
+                    let slot = Arc::clone(&slot);
+                    Box::new(move |clipboard, session| slot.bind(clipboard, session))
+                },
+                unbind: {
+                    let slot = Arc::clone(&slot);
+                    Box::new(move || slot.unbind())
+                },
+            });
+            let input = oink_input::linux_backend(Some(hooks))
+                .map_err(|e| anyhow::anyhow!("输入 backend：{e}"))?;
+            let clipboard = match oink_clipboard::portal_backend(slot) {
+                Ok(c) => Some(Arc::from(c)),
+                Err(e) => {
+                    tracing::warn!(%e, "剪贴板 backend 不可用");
+                    None
+                }
+            };
+            (input, clipboard)
+        };
+        #[cfg(not(target_os = "linux"))]
         let input = oink_input::platform_backend().map_err(|e| anyhow::anyhow!("输入 backend：{e}"))?;
-        let display = oink_display::platform_backend().map_err(|e| anyhow::anyhow!("显示器 backend：{e}"))?;
-        let displays = display.displays().map_err(|e| anyhow::anyhow!("枚举显示器：{e}"))?;
+        #[cfg(not(target_os = "linux"))]
         let clipboard = match oink_clipboard::platform_backend() {
             Ok(c) => Some(Arc::from(c)),
             Err(e) => {
@@ -121,6 +145,8 @@ impl NodeOptions {
                 None
             }
         };
+        let display = oink_display::platform_backend().map_err(|e| anyhow::anyhow!("显示器 backend：{e}"))?;
+        let displays = display.displays().map_err(|e| anyhow::anyhow!("枚举显示器：{e}"))?;
         Ok(Self {
             net,
             input: Arc::from(input),

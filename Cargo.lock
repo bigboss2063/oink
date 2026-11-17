@@ -3294,9 +3294,11 @@ name = "oink-clipboard"
 version = "0.3.6"
 dependencies = [
  "anyhow",
+ "ashpd",
  "blake3",
  "block2",
  "dispatch2",
+ "futures-util",
  "getrandom 0.3.4",
  "image",
  "libc",

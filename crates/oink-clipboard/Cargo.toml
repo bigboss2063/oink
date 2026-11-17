@@ -31,7 +31,10 @@ png = "0.18"
 tokio.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-zbus = { version = "6", default-features = false, features = ["tokio", "proxy"] }
+# Clipboard portal attaches to RemoteDesktop; screencast is pulled in by ashpd's remote_desktop module.
+ashpd = { version = "0.14", default-features = false, features = ["tokio", "clipboard", "remote_desktop", "screencast"] }
+futures-util = "0.3"
+zbus = { version = "6", default-features = false, features = ["tokio"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"

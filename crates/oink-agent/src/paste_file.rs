@@ -340,28 +340,36 @@ pub fn save(destination: &Path, settings: &Settings) -> anyhow::Result<Vec<PathB
             }
         }
     }
-    let backend = oink_clipboard::platform_backend()?;
-    // This is a consumer of the current local clipboard (including Oink-written
-    // delayed formats and file placeholders), never a new transport or offer.
-    let data = oink_foundation::paths::data_dir();
-    let captured = backend.capture(&data)?;
-    let provider = captured
-        .content
-        .ok_or_else(|| io::Error::other("native clipboard provider unavailable"))?;
-    if oink_clipboard::paste_file::select(&provider.inventory()).is_none() {
-        return Ok(vec![]);
+    #[cfg(target_os = "linux")]
+    {
+        // Portal clipboard is bound to the running agent's RemoteDesktop session.
+        anyhow::bail!("Linux 剪贴板挂在运行中的 Oink 输入会话上；独立 CLI 无法访问 portal 剪贴板")
     }
-    let now = time::OffsetDateTime::now_local()?;
-    let timestamp = now.format(time::macros::format_description!(
-        "[year]-[month]-[day] [hour].[minute].[second]"
-    ))?;
-    Ok(oink_clipboard::paste_file::save(
-        provider.as_ref(),
-        destination,
-        language(settings.ui_language),
-        &timestamp,
-        cfg!(windows),
-    )?)
+    #[cfg(not(target_os = "linux"))]
+    {
+        let backend = oink_clipboard::platform_backend()?;
+        // This is a consumer of the current local clipboard (including Oink-written
+        // delayed formats and file placeholders), never a new transport or offer.
+        let data = oink_foundation::paths::data_dir();
+        let captured = backend.capture(&data)?;
+        let provider = captured
+            .content
+            .ok_or_else(|| io::Error::other("native clipboard provider unavailable"))?;
+        if oink_clipboard::paste_file::select(&provider.inventory()).is_none() {
+            return Ok(vec![]);
+        }
+        let now = time::OffsetDateTime::now_local()?;
+        let timestamp = now.format(time::macros::format_description!(
+            "[year]-[month]-[day] [hour].[minute].[second]"
+        ))?;
+        Ok(oink_clipboard::paste_file::save(
+            provider.as_ref(),
+            destination,
+            language(settings.ui_language),
+            &timestamp,
+            cfg!(windows),
+        )?)
+    }
 }
 
 /// GUI-subsystem entry used by Explorer, before starting Tauri or the backend.

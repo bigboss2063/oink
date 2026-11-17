@@ -120,7 +120,9 @@ pub mod copy_diagnostics;
 pub mod dnd;
 pub mod formats;
 #[cfg(target_os = "linux")]
-mod linux;
+pub mod linux;
+#[cfg(target_os = "linux")]
+pub use linux::{PortalClipboardSlot, portal_backend};
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
@@ -359,6 +361,10 @@ pub fn named_pasteboard_backend(name: &str) -> Result<Box<dyn ClipboardBackend>,
 }
 
 /// 创建本机平台的实现。
+///
+/// On Linux this returns an unbound portal backend: reads/writes fail until a
+/// running Oink input session binds [`PortalClipboardSlot`]. Prefer
+/// [`portal_backend`] wired through the agent.
 pub fn platform_backend() -> Result<Box<dyn ClipboardBackend>, ClipboardError> {
     #[cfg(target_os = "macos")]
     return macos::backend();

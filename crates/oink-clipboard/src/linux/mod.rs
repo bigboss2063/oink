@@ -1,16 +1,24 @@
-//! KDE Plasma text clipboard via Klipper D-Bus (`org.kde.klipper`).
+//! Linux clipboard via `org.freedesktop.portal.Clipboard` (Plasma 6.4+).
 //!
-//! Text only for now — images and files are not published. Klipper is the
-//! session clipboard service on Plasma and supports background read/write
-//! without a focused surface. Changes arrive as `clipboardHistoryUpdated`; the
-//! signal has no payload, so each notification reads the current text once.
+//! The portal does not create its own session: it extends the RemoteDesktop
+//! session owned by `oink-input`. [`PortalClipboardSlot`] is filled after
+//! `RequestClipboard` succeeds, and cleared when that session drops.
+//!
+//! Text only for now — images and files are not published. Transfers use the
+//! MIME ownership protocol (`SetSelection` / `SelectionTransfer` /
+//! `SelectionRead`). Own writes are filtered with `session_is_owner`.
 
-use std::io;
+use std::io::{self, Read, Write};
+use std::os::fd::OwnedFd as StdOwnedFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use ashpd::desktop::clipboard::{Clipboard, SelectionOwnerChanged, SetSelectionOptions};
+use ashpd::desktop::remote_desktop::RemoteDesktop;
+use ashpd::desktop::Session;
+use futures_util::StreamExt;
 use oink_foundation::DeviceId;
 use oink_foundation::clipboard::{ClipData, ClipPlatform, ClipSnapshot, Sensitivity};
 use oink_foundation::content::{
@@ -18,12 +26,14 @@ use oink_foundation::content::{
     RepresentationId, StandardFormat, Unavailable,
 };
 use tokio::runtime::{Handle, Runtime};
-use zbus::Connection;
-use zbus::export::futures_core::Stream;
-use zbus::proxy;
+use tokio::sync::Notify;
 
 use crate::content::{self, Provider, Translator};
 use crate::{ChangeHandler, ClipboardBackend, ClipboardError, NativeSpec};
+
+const TEXT_UTF8: &str = "text/plain;charset=utf-8";
+const TEXT_PLAIN: &str = "text/plain";
+const TEXT_MIMES: &[&str] = &[TEXT_UTF8, TEXT_PLAIN];
 
 fn runtime() -> &'static Runtime {
     static RT: OnceLock<Runtime> = OnceLock::new();
@@ -42,8 +52,6 @@ where
     F: std::future::Future + Send,
     F::Output: Send,
 {
-    // A nested `Runtime::block_on` panics, and `block_in_place` also panics when
-    // the current thread is driving `block_on` rather than a multi-thread worker.
     if Handle::try_current().is_ok() {
         std::thread::scope(|scope| {
             scope
@@ -56,67 +64,187 @@ where
     }
 }
 
-#[proxy(
-    default_service = "org.kde.klipper",
-    default_path = "/klipper",
-    interface = "org.kde.klipper.klipper"
-)]
-trait Klipper {
-    #[zbus(name = "getClipboardContents")]
-    fn get_clipboard_contents(&self) -> zbus::Result<String>;
-
-    #[zbus(name = "setClipboardContents")]
-    fn set_clipboard_contents(&self, text: &str) -> zbus::Result<()>;
-
-    /// Klipper's history signal is camelCase, not the macro's default PascalCase.
-    #[zbus(signal, name = "clipboardHistoryUpdated")]
-    fn clipboard_history_updated(&self) -> zbus::Result<()>;
+/// Shared bind point between `oink-input` (RemoteDesktop lifetime) and this backend.
+pub struct PortalClipboardSlot {
+    bound: Mutex<Option<Arc<Bound>>>,
+    /// Wakes watch/transfer loops when the RemoteDesktop session binds or unbinds.
+    changed: Notify,
 }
 
-pub(crate) fn backend() -> Result<Box<dyn ClipboardBackend>, ClipboardError> {
+impl std::fmt::Debug for PortalClipboardSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let bound = self.bound.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+        f.debug_struct("PortalClipboardSlot").field("bound", &bound).finish()
+    }
+}
+
+struct Bound {
+    clipboard: Clipboard,
+    session: Arc<Session<RemoteDesktop>>,
+    /// D-Bus object-path encoding of `session` for signal filtering.
+    session_key: Vec<u8>,
+}
+
+impl PortalClipboardSlot {
+    pub fn new() -> Self {
+        Self {
+            bound: Mutex::new(None),
+            changed: Notify::new(),
+        }
+    }
+
+    /// Attach clipboard access for a live RemoteDesktop session.
+    pub fn bind(&self, clipboard: Clipboard, session: Arc<Session<RemoteDesktop>>) {
+        let session_key = session_key(session.as_ref());
+        *self.bound.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(Arc::new(Bound { clipboard, session, session_key }));
+        self.changed.notify_waiters();
+    }
+
+    pub fn unbind(&self) {
+        *self.bound.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.changed.notify_waiters();
+    }
+
+    fn get(&self) -> Result<Arc<Bound>, ClipboardError> {
+        self.bound
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .ok_or_else(|| {
+                ClipboardError::Platform(
+                    "剪贴板 portal 尚未绑定（需要运行中的 Oink RemoteDesktop 会话）".into(),
+                )
+            })
+    }
+}
+
+/// Portal-backed Linux clipboard. Operations fail until [`PortalClipboardSlot::bind`].
+pub fn portal_backend(slot: Arc<PortalClipboardSlot>) -> Result<Box<dyn ClipboardBackend>, ClipboardError> {
     let session = std::env::var("XDG_SESSION_TYPE").unwrap_or_default();
     if !session.eq_ignore_ascii_case("wayland") && std::env::var_os("WAYLAND_DISPLAY").is_none() {
         return Err(ClipboardError::Platform(
             "需要 Wayland 会话（XDG_SESSION_TYPE=wayland 或 WAYLAND_DISPLAY）".into(),
         ));
     }
-    let (klipper, current) = block_on(async {
-        let conn = Connection::session()
-            .await
-            .map_err(|e| ClipboardError::Platform(format!("连接 session bus 失败：{e}")))?;
-        let klipper = KlipperProxy::new(&conn)
-            .await
-            .map_err(|e| ClipboardError::Platform(format!("连接 Klipper 失败：{e}")))?;
-        let current = klipper
-            .get_clipboard_contents()
-            .await
-            .map_err(|e| ClipboardError::Platform(format!("读取 Klipper 剪贴板失败：{e}")))?;
-        Ok::<_, ClipboardError>((klipper, current))
-    })?;
+    let offer = Arc::new(tokio::sync::Mutex::new(None));
+    let transfer = TransferServer::start(Arc::clone(&slot), Arc::clone(&offer))?;
     Ok(Box::new(LinuxClipboard {
-        klipper,
-        last: Arc::new(tokio::sync::Mutex::new(current)),
+        slot,
+        last: Arc::new(tokio::sync::Mutex::new(String::new())),
+        offer,
         change_count: Arc::new(AtomicU64::new(1)),
         watcher: Mutex::new(None),
+        transfer: Mutex::new(Some(transfer)),
         watch_paused: Arc::new(AtomicBool::new(false)),
     }))
 }
 
+/// Same as [`portal_backend`] with an unbound slot (standalone helpers / tests).
+pub(crate) fn backend() -> Result<Box<dyn ClipboardBackend>, ClipboardError> {
+    portal_backend(Arc::new(PortalClipboardSlot::new()))
+}
+
 struct LinuxClipboard {
-    klipper: KlipperProxy<'static>,
-    /// Last text attributed to a change count. Our own writes and the watcher
-    /// both update it under this lock, so a write is never seen as external.
+    slot: Arc<PortalClipboardSlot>,
     last: Arc<tokio::sync::Mutex<String>>,
+    /// Text we currently advertise via `SetSelection`, served on `SelectionTransfer`.
+    offer: Arc<tokio::sync::Mutex<Option<String>>>,
     change_count: Arc<AtomicU64>,
     watcher: Mutex<Option<Watcher>>,
+    /// Serves `SelectionTransfer` for our `SetSelection` even when watch is off.
+    transfer: Mutex<Option<TransferServer>>,
     watch_paused: Arc<AtomicBool>,
 }
 
 impl LinuxClipboard {
-    fn current_text(&self) -> Result<String, ClipboardError> {
-        block_on(self.klipper.get_clipboard_contents())
-            .map_err(|e| ClipboardError::Platform(format!("getClipboardContents：{e}")))
+    async fn read_text_async(&self) -> Result<String, ClipboardError> {
+        let bound = self.slot.get()?;
+        read_plain_text(&bound.clipboard, bound.session.as_ref()).await
     }
+
+    async fn write_text_async(&self, text: &str) -> Result<u64, ClipboardError> {
+        let bound = self.slot.get()?;
+        {
+            let mut offer = self.offer.lock().await;
+            *offer = Some(text.to_owned());
+        }
+        bound
+            .clipboard
+            .set_selection(
+                bound.session.as_ref(),
+                SetSelectionOptions::default().set_mime_types(TEXT_MIMES),
+            )
+            .await
+            .map_err(|e| ClipboardError::Platform(format!("SetSelection：{e}")))?;
+        let mut last = self.last.lock().await;
+        text.clone_into(&mut *last);
+        Ok(self.change_count.fetch_add(1, Ordering::AcqRel) + 1)
+    }
+}
+
+fn session_key(session: &Session<RemoteDesktop>) -> Vec<u8> {
+    use zbus::wire::{Endian, serialized::Context, to_bytes};
+    let ctx = Context::new(Endian::Little, 0);
+    to_bytes(ctx, session)
+        .map(|data| data.bytes().to_vec())
+        .unwrap_or_default()
+}
+
+fn same_session(bound: &Bound, event: &Session<RemoteDesktop>) -> bool {
+    !bound.session_key.is_empty() && bound.session_key == session_key(event)
+}
+
+/// Successful empty read is `Ok("")`. Every MIME failing is `Err` (do not treat as clear).
+fn text_from_selection_reads(results: &[Result<Vec<u8>, String>]) -> Result<String, ClipboardError> {
+    let mut last_err = None;
+    for result in results {
+        match result {
+            Ok(bytes) => return decode_text(bytes),
+            Err(error) => last_err = Some(error.clone()),
+        }
+    }
+    Err(ClipboardError::Platform(format!(
+        "SelectionRead：{}",
+        last_err.unwrap_or_else(|| "no text MIME".into())
+    )))
+}
+
+async fn read_plain_text(clipboard: &Clipboard, session: &Session<RemoteDesktop>) -> Result<String, ClipboardError> {
+    let mut results = Vec::with_capacity(TEXT_MIMES.len());
+    for mime in TEXT_MIMES {
+        match clipboard.selection_read(session, mime).await {
+            Ok(fd) => match read_all_fd(fd) {
+                Ok(bytes) => results.push(Ok(bytes)),
+                Err(error) => results.push(Err(error.to_string())),
+            },
+            Err(error) => {
+                tracing::trace!(%error, mime, "SelectionRead mime unavailable");
+                results.push(Err(error.to_string()));
+            }
+        }
+    }
+    text_from_selection_reads(&results)
+}
+
+fn read_all_fd(fd: zbus::wire::OwnedFd) -> io::Result<Vec<u8>> {
+    let std_fd: StdOwnedFd = fd.into();
+    let mut file = std::fs::File::from(std_fd);
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn write_all_fd(fd: zbus::wire::OwnedFd, bytes: &[u8]) -> io::Result<()> {
+    let std_fd: StdOwnedFd = fd.into();
+    let mut file = std::fs::File::from(std_fd);
+    file.write_all(bytes)?;
+    Ok(())
+}
+
+fn decode_text(bytes: &[u8]) -> Result<String, ClipboardError> {
+    let text = String::from_utf8_lossy(bytes);
+    Ok(text.trim_end_matches('\0').to_owned())
 }
 
 impl ClipboardBackend for LinuxClipboard {
@@ -125,7 +253,7 @@ impl ClipboardBackend for LinuxClipboard {
     }
 
     fn read(&self) -> Result<ClipSnapshot, ClipboardError> {
-        let text = self.current_text()?;
+        let text = block_on(self.read_text_async())?;
         let mut items = Vec::new();
         if !text.is_empty() {
             items.push(ClipData::Text(text));
@@ -139,18 +267,19 @@ impl ClipboardBackend for LinuxClipboard {
 
     fn capture(&self, _data: &std::path::Path) -> Result<crate::CapturedClipboard, ClipboardError> {
         let count = self.change_count();
-        let text = self.current_text()?;
+        let text = block_on(self.read_text_async())?;
         if self.change_count() != count {
             return Err(ClipboardError::Busy);
         }
-        let klipper = self.klipper.clone();
+        let slot = Arc::clone(&self.slot);
         let counts = Arc::clone(&self.change_count);
         let provider = serve_text(count, text, move || {
             if counts.load(Ordering::Acquire) != count {
                 return Err(content::clipboard::changed());
             }
-            let current =
-                block_on(klipper.get_clipboard_contents()).map_err(|error| io::Error::other(error.to_string()))?;
+            let bound = slot.get().map_err(|e| io::Error::other(e.to_string()))?;
+            let current = block_on(read_plain_text(&bound.clipboard, bound.session.as_ref()))
+                .map_err(|e| io::Error::other(e.to_string()))?;
             if counts.load(Ordering::Acquire) != count {
                 return Err(content::clipboard::changed());
             }
@@ -179,15 +308,7 @@ impl ClipboardBackend for LinuxClipboard {
         let Some(text) = text else {
             return Err(ClipboardError::Unsupported);
         };
-        block_on(async {
-            let mut last = self.last.lock().await;
-            self.klipper
-                .set_clipboard_contents(text)
-                .await
-                .map_err(|e| ClipboardError::Platform(format!("setClipboardContents：{e}")))?;
-            text.clone_into(&mut *last);
-            Ok(self.change_count.fetch_add(1, Ordering::AcqRel) + 1)
-        })
+        block_on(self.write_text_async(text))
     }
 
     fn write_native(&self, spec: NativeSpec) -> Result<u64, ClipboardError> {
@@ -224,7 +345,7 @@ impl ClipboardBackend for LinuxClipboard {
             }
             None => {
                 *slot = Some(Watcher::start(
-                    self.klipper.clone(),
+                    Arc::clone(&self.slot),
                     Arc::clone(&self.last),
                     Arc::clone(&self.change_count),
                     Arc::clone(&self.watch_paused),
@@ -243,21 +364,21 @@ impl ClipboardBackend for LinuxClipboard {
 
 struct Watcher {
     stop: Arc<AtomicBool>,
-    wake: Arc<tokio::sync::Notify>,
+    wake: Arc<Notify>,
     handlers: Arc<Mutex<Vec<ChangeHandler>>>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl Watcher {
     fn start(
-        klipper: KlipperProxy<'static>,
+        slot: Arc<PortalClipboardSlot>,
         last: Arc<tokio::sync::Mutex<String>>,
         change_count: Arc<AtomicU64>,
         paused: Arc<AtomicBool>,
         first: ChangeHandler,
     ) -> Result<Self, ClipboardError> {
         let stop = Arc::new(AtomicBool::new(false));
-        let wake = Arc::new(tokio::sync::Notify::new());
+        let wake = Arc::new(Notify::new());
         let handlers = Arc::new(Mutex::new(vec![first]));
         let thread_stop = Arc::clone(&stop);
         let thread_wake = Arc::clone(&wake);
@@ -266,7 +387,7 @@ impl Watcher {
             .name("oink-clipboard-watch".into())
             .spawn(move || {
                 runtime().block_on(run_watch(
-                    klipper,
+                    slot,
                     last,
                     thread_stop,
                     thread_wake,
@@ -299,75 +420,199 @@ impl Drop for Watcher {
     }
 }
 
+struct TransferServer {
+    stop: Arc<AtomicBool>,
+    wake: Arc<Notify>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl TransferServer {
+    fn start(
+        slot: Arc<PortalClipboardSlot>,
+        offer: Arc<tokio::sync::Mutex<Option<String>>>,
+    ) -> Result<Self, ClipboardError> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let wake = Arc::new(Notify::new());
+        let thread_stop = Arc::clone(&stop);
+        let thread_wake = Arc::clone(&wake);
+        let thread = std::thread::Builder::new()
+            .name("oink-clipboard-xfer".into())
+            .spawn(move || {
+                runtime().block_on(run_transfer(slot, offer, thread_stop, thread_wake));
+            })
+            .map_err(|e| ClipboardError::Platform(format!("启动剪贴板 transfer 失败：{e}")))?;
+        Ok(Self {
+            stop,
+            wake,
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for TransferServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        self.wake.notify_one();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 async fn run_watch(
-    klipper: KlipperProxy<'static>,
+    slot: Arc<PortalClipboardSlot>,
     last: Arc<tokio::sync::Mutex<String>>,
     stop: Arc<AtomicBool>,
-    wake: Arc<tokio::sync::Notify>,
+    wake: Arc<Notify>,
     paused: Arc<AtomicBool>,
     handlers: Arc<Mutex<Vec<ChangeHandler>>>,
     change_count: Arc<AtomicU64>,
 ) {
-    let mut backoff = Duration::from_millis(200);
     while !stop.load(Ordering::Acquire) {
-        let stream = tokio::select! {
-            _ = wake.notified() => return,
-            stream = klipper.receive_clipboard_history_updated() => stream,
+        let Some(bound) = slot.bound.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
+            tokio::select! {
+                _ = wake.notified() => return,
+                _ = slot.changed.notified() => continue,
+            }
         };
-        let stream = match stream {
+
+        let owner_stream = match bound.clipboard.receive_selection_owner_changed::<RemoteDesktop>().await {
             Ok(stream) => stream,
             Err(error) => {
-                tracing::warn!(%error, "订阅 Klipper clipboardHistoryUpdated 失败");
+                tracing::warn!(%error, "订阅 SelectionOwnerChanged 失败");
                 tokio::select! {
                     _ = wake.notified() => return,
-                    _ = tokio::time::sleep(backoff) => {}
+                    _ = tokio::time::sleep(Duration::from_millis(500)) => continue,
                 }
-                backoff = (backoff * 2).min(Duration::from_secs(5));
-                continue;
             }
         };
-        backoff = Duration::from_millis(200);
-        let mut stream = std::pin::pin!(stream);
-        while !stop.load(Ordering::Acquire) {
-            let signal = tokio::select! {
+
+        let mut owner_stream = std::pin::pin!(owner_stream);
+        loop {
+            tokio::select! {
                 _ = wake.notified() => return,
-                signal = std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)) => signal,
-            };
-            let Some(_signal) = signal else {
-                break;
-            };
-            if paused.load(Ordering::Acquire) {
-                continue;
-            }
-            if !observe_change(&klipper, &last, &change_count).await {
-                continue;
-            }
-            let list = handlers.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            for handler in list {
-                handler();
+                _ = slot.changed.notified() => break,
+                event = owner_stream.next() => {
+                    let Some((event_session, change)) = event else { break };
+                    if !same_session(&bound, &event_session) {
+                        continue;
+                    }
+                    if paused.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    if !observe_change(&bound.clipboard, bound.session.as_ref(), &change, &last, &change_count).await {
+                        continue;
+                    }
+                    let list = handlers.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    for handler in list {
+                        handler();
+                    }
+                }
             }
         }
     }
 }
 
-/// Read once per notification. The write path holds `last` across
-/// `setClipboardContents`, so this cannot observe our own write before `last`
-/// is updated.
+async fn run_transfer(
+    slot: Arc<PortalClipboardSlot>,
+    offer: Arc<tokio::sync::Mutex<Option<String>>>,
+    stop: Arc<AtomicBool>,
+    wake: Arc<Notify>,
+) {
+    while !stop.load(Ordering::Acquire) {
+        let Some(bound) = slot.bound.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
+            tokio::select! {
+                _ = wake.notified() => return,
+                _ = slot.changed.notified() => continue,
+            }
+        };
+
+        let transfer_stream = match bound.clipboard.receive_selection_transfer::<RemoteDesktop>().await {
+            Ok(stream) => stream,
+            Err(error) => {
+                tracing::warn!(%error, "订阅 SelectionTransfer 失败");
+                tokio::select! {
+                    _ = wake.notified() => return,
+                    _ = tokio::time::sleep(Duration::from_millis(500)) => continue,
+                }
+            }
+        };
+
+        let mut transfer_stream = std::pin::pin!(transfer_stream);
+        loop {
+            tokio::select! {
+                _ = wake.notified() => return,
+                _ = slot.changed.notified() => break,
+                event = transfer_stream.next() => {
+                    let Some((event_session, mime, serial)) = event else { break };
+                    if !same_session(&bound, &event_session) {
+                        continue;
+                    }
+                    serve_transfer(&bound.clipboard, bound.session.as_ref(), &mime, serial, &offer).await;
+                }
+            }
+        }
+    }
+}
+
 async fn observe_change(
-    klipper: &KlipperProxy<'_>,
+    clipboard: &Clipboard,
+    session: &Session<RemoteDesktop>,
+    change: &SelectionOwnerChanged,
     last: &tokio::sync::Mutex<String>,
     change_count: &AtomicU64,
 ) -> bool {
-    let mut last = last.lock().await;
-    let Ok(text) = klipper.get_clipboard_contents().await else {
+    if change.session_is_owner() == Some(true) {
+        return false;
+    }
+    let mimes = change.mime_types();
+    if mimes.is_empty() {
+        let mut last = last.lock().await;
+        if last.is_empty() {
+            return false;
+        }
+        last.clear();
+        change_count.fetch_add(1, Ordering::AcqRel);
+        return true;
+    }
+    if !mimes.iter().any(|mime| mime.starts_with("text/plain")) {
+        return false;
+    }
+    let Ok(text) = read_plain_text(clipboard, session).await else {
+        // Read failure must not look like an empty clipboard.
         return false;
     };
+    let mut last = last.lock().await;
     if text == *last {
         return false;
     }
     *last = text;
     change_count.fetch_add(1, Ordering::AcqRel);
     true
+}
+
+async fn serve_transfer(
+    clipboard: &Clipboard,
+    session: &Session<RemoteDesktop>,
+    mime: &str,
+    serial: u32,
+    offer: &tokio::sync::Mutex<Option<String>>,
+) {
+    let text = offer.lock().await.clone();
+    let Some(text) = text else {
+        let _ = clipboard.selection_write_done(session, serial, false).await;
+        return;
+    };
+    if mime != TEXT_UTF8 && mime != TEXT_PLAIN {
+        let _ = clipboard.selection_write_done(session, serial, false).await;
+        return;
+    }
+    let Ok(fd) = clipboard.selection_write(session, serial).await else {
+        let _ = clipboard.selection_write_done(session, serial, false).await;
+        return;
+    };
+    let ok = write_all_fd(fd, text.as_bytes()).is_ok();
+    let _ = clipboard.selection_write_done(session, serial, ok).await;
 }
 
 struct Utf8Text;
@@ -442,7 +687,7 @@ fn serve_text(
     Ok(provider)
 }
 
-/// Klipper's D-Bus text API cannot mark Concealed/Transient/AutoGenerated.
+/// Portal SetSelection cannot mark Concealed/Transient/AutoGenerated.
 /// Writing them as plain text would land secrets in history — fail closed.
 fn publishable_sensitivity(sensitivity: Sensitivity) -> Result<(), ClipboardError> {
     match sensitivity {
@@ -539,7 +784,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_clipboard_has_no_representations() {
+    fn empty_clipboard_has_no_items() {
         let provider = serve_text(1, String::new(), || Ok(String::new())).unwrap();
         assert!(provider.inventory().items.is_empty());
         assert!(provider.inventory().validate().is_ok());
@@ -671,59 +916,19 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "需要正在运行的 Plasma 会话和 Klipper"]
-    fn klipper_signal_reports_external_text_only() {
-        let backend = backend().expect("klipper");
-        let original = backend.read().expect("read").items;
-        let _restore = Restore {
-            backend: backend.as_ref(),
-            original,
-        };
-        let seen = Arc::new(AtomicU64::new(0));
-        let flag = Arc::clone(&seen);
-        backend
-            .watch(Arc::new(move || {
-                flag.fetch_add(1, Ordering::AcqRel);
-            }))
-            .unwrap();
-        std::thread::sleep(Duration::from_millis(500));
-        let marker = format!("oink-signal-{}", std::process::id());
-        backend
-            .write(&[ClipData::Text(marker.clone())], Sensitivity::Normal)
-            .unwrap();
-        std::thread::sleep(Duration::from_millis(400));
-        assert_eq!(seen.load(Ordering::Acquire), 0, "本机写入被当成了外部变化");
-
-        let external = format!("{marker}-external");
-        block_on(async {
-            let conn = Connection::session().await.unwrap();
-            let klipper = KlipperProxy::new(&conn).await.unwrap();
-            klipper.set_clipboard_contents(&external).await.unwrap();
-        });
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while seen.load(Ordering::Acquire) == 0 && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert_eq!(seen.load(Ordering::Acquire), 1, "clipboardHistoryUpdated 没有叫醒监听");
-        let captured = backend.capture(std::path::Path::new("unused")).unwrap();
-        let provider = captured.content.expect("provider");
-        let mut reader = provider.open(RepresentationId(1)).unwrap();
-        assert_eq!(content::read_all(&mut reader).unwrap(), external.as_bytes());
+    fn unbound_slot_rejects_read() {
+        let backend = portal_backend(Arc::new(PortalClipboardSlot::new())).unwrap();
+        assert!(matches!(backend.read(), Err(ClipboardError::Platform(_))));
     }
 
-    struct Restore<'a> {
-        backend: &'a dyn ClipboardBackend,
-        original: Vec<ClipData>,
-    }
-    impl Drop for Restore<'_> {
-        fn drop(&mut self) {
-            let text = self.original.iter().find_map(|item| match item {
-                ClipData::Text(text) => Some(text.clone()),
-                _ => None,
-            });
-            if let Some(text) = text {
-                let _ = self.backend.write(&[ClipData::Text(text)], Sensitivity::Normal);
-            }
-        }
+    #[test]
+    fn selection_read_failures_are_not_empty_clipboard() {
+        let err = text_from_selection_reads(&[Err("nope".into()), Err("still nope".into())]);
+        assert!(matches!(err, Err(ClipboardError::Platform(_))));
+        assert_eq!(text_from_selection_reads(&[Ok(Vec::new())]).unwrap(), "");
+        assert_eq!(
+            text_from_selection_reads(&[Err("x".into()), Ok(b"hi".to_vec())]).unwrap(),
+            "hi"
+        );
     }
 }

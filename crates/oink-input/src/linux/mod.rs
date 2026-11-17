@@ -2,13 +2,17 @@
 //!
 //! - Capture: `InputCapture` barriers + EIS receiver → [`crate::capture_loop`]
 //! - Inject: `RemoteDesktop` EIS sender (absolute pointer device covers all outputs)
+//! - Clipboard: `RequestClipboard` on the RemoteDesktop session (Plasma 6.4+)
 //! - Coordinates: compositor logical pixels (same as `oink-display` linux)
 
 mod capture;
+mod clipboard_hooks;
 mod eis_inject;
 mod keymap;
 mod portal;
 mod runtime;
+
+pub use clipboard_hooks::ClipboardPortalHooks;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -25,7 +29,7 @@ use crate::{EventHandler, InputBackend, InputError, capture_loop};
 const OINK_WHEEL_PIXELS_PER_NOTCH: f64 = 96.0;
 const WHEEL_LINES_PER_NOTCH: f64 = 3.0;
 
-pub(crate) fn backend() -> Result<Box<dyn InputBackend>, InputError> {
+pub fn backend(clipboard: Option<Arc<ClipboardPortalHooks>>) -> Result<Box<dyn InputBackend>, InputError> {
     let session = std::env::var("XDG_SESSION_TYPE").unwrap_or_default();
     if !session.eq_ignore_ascii_case("wayland") && std::env::var_os("WAYLAND_DISPLAY").is_none() {
         return Err(InputError::Platform(
@@ -33,6 +37,7 @@ pub(crate) fn backend() -> Result<Box<dyn InputBackend>, InputError> {
         ));
     }
     Ok(Box::new(LinuxInput {
+        clipboard,
         portals: Mutex::new(None),
         capture: Mutex::new(None),
         mode: Arc::new(Mutex::new(CaptureMode::Local)),
@@ -44,6 +49,7 @@ pub(crate) fn backend() -> Result<Box<dyn InputBackend>, InputError> {
 }
 
 struct LinuxInput {
+    clipboard: Option<Arc<ClipboardPortalHooks>>,
     portals: Mutex<Option<Arc<portal::PortalSessions>>>,
     capture: Mutex<Option<capture::CaptureHandle>>,
     mode: Arc<Mutex<CaptureMode>>,
@@ -59,7 +65,7 @@ impl LinuxInput {
         if let Some(existing) = slot.as_ref() {
             return Ok(Arc::clone(existing));
         }
-        match portal::PortalSessions::open() {
+        match portal::PortalSessions::open(self.clipboard.clone()) {
             Ok(sessions) => {
                 self.granted.store(true, Ordering::Release);
                 self.denied.store(false, Ordering::Release);
@@ -144,6 +150,7 @@ impl InputBackend for LinuxInput {
             }
             // The loop exited by itself and consumed the session's single EIS fd.
             *capture = None;
+            // Dropping PortalSessions unbinds the clipboard slot.
             *self.portals.lock().unwrap_or_else(|e| e.into_inner()) = None;
         }
         let portals = self.ensure_portals()?;
