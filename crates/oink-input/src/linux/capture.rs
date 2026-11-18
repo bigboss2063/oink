@@ -1,6 +1,6 @@
 //! InputCapture activation + libei receiver → [`crate::capture_loop::CaptureLoop`].
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -78,16 +78,24 @@ impl Drop for CaptureHandle {
 
 #[derive(Default)]
 struct CaptureState {
-    held_keys: HashSet<KeyCode>,
-    held_buttons: HashSet<MouseButton>,
+    /// Portal grab generation. A replacement activation does not deliver ups for the previous grab.
+    session: u64,
+    held_keys: HashMap<KeyCode, u64>,
+    held_buttons: HashMap<MouseButton, u64>,
     repeat: Option<(KeyCode, Instant)>,
 }
 
 impl CaptureState {
+    fn rotate_session(&mut self) -> u64 {
+        let ended = self.session;
+        self.session = self.session.wrapping_add(1);
+        ended
+    }
+
     fn key_event(&mut self, code: KeyCode, pressed: bool, now: Instant) {
         let feel = FeelProfile::default();
         if pressed {
-            self.held_keys.insert(code);
+            self.held_keys.insert(code, self.session);
             if !code.is_modifier() && code != KeyCode::CAPS_LOCK {
                 self.repeat = Some((code, now + Duration::from_millis(u64::from(feel.key_repeat_delay_ms))));
             }
@@ -101,7 +109,7 @@ impl CaptureState {
 
     fn button_event(&mut self, button: MouseButton, pressed: bool) {
         if pressed {
-            self.held_buttons.insert(button);
+            self.held_buttons.insert(button, self.session);
         } else {
             self.held_buttons.remove(&button);
         }
@@ -117,15 +125,65 @@ impl CaptureState {
         Some(code)
     }
 
-    fn release_all(&mut self, mode: &Mutex<CaptureMode>, cursor: &Mutex<Point>) {
+    fn take_session(&mut self, session: u64) -> (Vec<MouseButton>, Vec<KeyCode>) {
+        if self
+            .repeat
+            .as_ref()
+            .is_some_and(|(code, _)| self.held_keys.get(code) == Some(&session))
+        {
+            self.repeat = None;
+        }
+        let mut buttons = Vec::new();
+        self.held_buttons.retain(|button, generation| {
+            if *generation == session {
+                buttons.push(*button);
+                false
+            } else {
+                true
+            }
+        });
+        let mut keys = Vec::new();
+        self.held_keys.retain(|code, generation| {
+            if *generation == session {
+                keys.push(*code);
+                false
+            } else {
+                true
+            }
+        });
+        (buttons, keys)
+    }
+
+    /// Returns whether any held button or key was released.
+    fn release_session(&mut self, session: u64, mode: &Mutex<CaptureMode>, cursor: &Mutex<Point>) -> bool {
+        let (buttons, keys) = self.take_session(session);
+        self.emit_releases(buttons, keys, mode, cursor)
+    }
+
+    fn release_all(&mut self, mode: &Mutex<CaptureMode>, cursor: &Mutex<Point>) -> bool {
         self.repeat = None;
+        let buttons: Vec<_> = self.held_buttons.drain().map(|(button, _)| button).collect();
+        let keys: Vec<_> = self.held_keys.drain().map(|(code, _)| code).collect();
+        self.emit_releases(buttons, keys, mode, cursor)
+    }
+
+    fn emit_releases(
+        &self,
+        buttons: Vec<MouseButton>,
+        keys: Vec<KeyCode>,
+        mode: &Mutex<CaptureMode>,
+        cursor: &Mutex<Point>,
+    ) -> bool {
+        if buttons.is_empty() && keys.is_empty() {
+            return false;
+        }
         let remote = is_remote(mode);
         let cur = if remote {
             None
         } else {
             Some(*cursor.lock().unwrap_or_else(|e| e.into_inner()))
         };
-        for button in self.held_buttons.drain() {
+        for button in buttons {
             let _ = dispatch(
                 mode,
                 CapturedEvent {
@@ -137,7 +195,7 @@ impl CaptureState {
                 },
             );
         }
-        for code in self.held_keys.drain() {
+        for code in keys {
             let _ = dispatch(
                 mode,
                 CapturedEvent {
@@ -149,6 +207,7 @@ impl CaptureState {
                 },
             );
         }
+        true
     }
 }
 
@@ -225,6 +284,11 @@ fn run(
                         super::portal::ActivationKind::KeepAsRemote => {
                             // Armed after a remote pointer left Linux (or while already remote):
                             // KWin now hides the cursor; do not emit a fake physical event.
+                            // The new grab does not continue the previous grab's key stream.
+                            let ended = state.rotate_session();
+                            if state.release_session(ended, &mode, &cursor) {
+                                poll_now = true;
+                            }
                             portals.set_activation(activation_id);
                             capturing = true;
                         }
@@ -232,11 +296,16 @@ fn run(
                             // `restore_local` leaves the arm ticket set so this late Activated
                             // is still synthetic (not a real edge). Release at the current local
                             // cursor so KWin does not trap local input.
+                            if state.release_all(&mode, &cursor) {
+                                poll_now = true;
+                            }
                             let cur = *cursor.lock().unwrap_or_else(|e| e.into_inner());
                             let _ = portals.release_id_async(activation_id, cur).await;
                             capturing = false;
                         }
                         super::portal::ActivationKind::EmitEdge => {
+                            let ended = state.rotate_session();
+                            state.release_session(ended, &mode, &cursor);
                             portals.set_activation(activation_id);
                             capturing = true;
                             let cur = if let Some((x, y)) = msg.cursor_position() {
@@ -266,6 +335,7 @@ fn run(
                             // or edge resistance not yet exceeded), release InputCapture immediately
                             // so the cursor stays visible and local clicks/keys work normally.
                             if !is_remote(&mode) {
+                                state.release_all(&mode, &cursor);
                                 let _ = portals.release_id_async(activation_id, cur).await;
                                 capturing = false;
                             }
@@ -477,10 +547,11 @@ async fn handle_ei(
     }
 
     if dispatched && *capturing && !is_remote(mode) {
+        // Focus is already local, so this grab is about to drop the rest of the key stream.
+        state.release_all(mode, cursor);
         let cur = *cursor.lock().unwrap_or_else(|e| e.into_inner());
         let _ = portals.release_current_async(cur).await;
         *capturing = false;
-        state.repeat = None;
     }
 
     Ok(dispatched)
@@ -499,5 +570,33 @@ fn dispatch(mode: &Mutex<CaptureMode>, event: CapturedEvent) -> Disposition {
         Disposition::Swallow
     } else {
         disposition
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replacing_a_grab_releases_only_that_grab() {
+        let mut state = CaptureState::default();
+        state.rotate_session();
+        state.key_event(KeyCode::LEFT_CTRL, true, Instant::now());
+        state.button_event(MouseButton::Left, true);
+        state.key_event(KeyCode::keyboard(0x04), true, Instant::now());
+        let ended = state.rotate_session();
+        state.key_event(KeyCode::LEFT_ALT, true, Instant::now());
+
+        let (buttons, keys) = state.take_session(ended);
+        assert_eq!(buttons, vec![MouseButton::Left]);
+        assert_eq!(
+            keys.into_iter().collect::<std::collections::BTreeSet<_>>(),
+            [KeyCode::LEFT_CTRL, KeyCode::keyboard(0x04)].into()
+        );
+        assert!(state.repeat.is_none(), "repeat belongs to the grab that ended");
+        assert_eq!(
+            state.held_keys.keys().copied().collect::<Vec<_>>(),
+            vec![KeyCode::LEFT_ALT]
+        );
     }
 }
