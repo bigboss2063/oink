@@ -270,10 +270,17 @@ impl Namespace for LocalNamespace {
         Some(self.list(node, cursor))
     }
     fn native_open(&self, node: NodeId, offset: u64) -> Option<io::Result<FileReader>> {
-        Some(self.native().and_then(|native| native.open(node, offset)))
+        match self.native() {
+            Ok(native) => Some(native.open(node, offset)),
+            // Unbound native: fall through to source/wire open when present.
+            Err(_) => None,
+        }
     }
     fn native_metadata(&self, node: NodeId) -> Option<io::Result<crate::FileMetadata>> {
-        Some(self.native().and_then(|native| native.metadata(node)))
+        match self.native() {
+            Ok(native) => Some(native.metadata(node)),
+            Err(_) => None,
+        }
     }
     fn source_link(&self) -> Option<Descriptor> {
         self.source.as_ref()?.source_link()

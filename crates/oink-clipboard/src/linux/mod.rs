@@ -4,26 +4,33 @@
 //! session owned by `oink-input`. [`PortalClipboardSlot`] is filled after
 //! `RequestClipboard` succeeds, and cleared when that session drops.
 //!
-//! Text only for now — images and files are not published. Transfers use the
-//! MIME ownership protocol (`SetSelection` / `SelectionTransfer` /
+//! Text, PNG, and local files (`text/uri-list` / GNOME copied-files). Transfers
+//! use the MIME ownership protocol (`SetSelection` / `SelectionTransfer` /
 //! `SelectionRead`). Own writes are filtered with `session_is_owner`.
+//!
+//! shortcut: virtual / on-demand files have no portal File Provider; only
+//! materialized `local_path` roots are published. Upgrade if a Linux placeholder
+//! API appears.
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::io::{self, Read, Write};
 use std::os::fd::OwnedFd as StdOwnedFd;
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ashpd::desktop::clipboard::{Clipboard, SelectionOwnerChanged, SetSelectionOptions};
 use ashpd::desktop::remote_desktop::RemoteDesktop;
 use ashpd::desktop::Session;
 use futures_util::StreamExt;
 use oink_foundation::DeviceId;
-use oink_foundation::clipboard::{ClipData, ClipPlatform, ClipSnapshot, Sensitivity};
+use oink_foundation::clipboard::{ClipData, ClipPlatform, ClipSnapshot, FileEntry, Sensitivity};
 use oink_foundation::content::{
-    ClipId, ContentItem, ContentSize, ItemId, Medium, NativeFormat, OfferId, Representation, RepresentationData,
-    RepresentationId, StandardFormat, Unavailable,
+    ClipId, ContentItem, ContentSize, ItemId, Medium, NativeFormat, NodeId, OfferId, Representation,
+    RepresentationData, RepresentationId, StandardFormat, Unavailable,
 };
 use tokio::runtime::{Handle, Runtime};
 use tokio::sync::Notify;
@@ -31,9 +38,21 @@ use tokio::sync::Notify;
 use crate::content::{self, Provider, Translator};
 use crate::{ChangeHandler, ClipboardBackend, ClipboardError, NativeSpec};
 
+// Pure DIB↔PNG codec shared with the Windows backend (no Win32).
+#[path = "../windows/image.rs"]
+mod windows_image;
+
 const TEXT_UTF8: &str = "text/plain;charset=utf-8";
+/// `CF_DIB`
+const CF_DIB: u16 = 8;
+/// `CF_DIBV5`
+const CF_DIBV5: u16 = 17;
 const TEXT_PLAIN: &str = "text/plain";
 const TEXT_MIMES: &[&str] = &[TEXT_UTF8, TEXT_PLAIN];
+const IMAGE_PNG: &str = "image/png";
+const URI_LIST: &str = "text/uri-list";
+const GNOME_COPIED: &str = "x-special/gnome-copied-files";
+const PNG_MAGIC: &[u8] = b"\x89PNG\r\n\x1a\n";
 
 fn runtime() -> &'static Runtime {
     static RT: OnceLock<Runtime> = OnceLock::new();
@@ -127,11 +146,11 @@ pub fn portal_backend(slot: Arc<PortalClipboardSlot>) -> Result<Box<dyn Clipboar
             "需要 Wayland 会话（XDG_SESSION_TYPE=wayland 或 WAYLAND_DISPLAY）".into(),
         ));
     }
-    let offer = Arc::new(tokio::sync::Mutex::new(None));
+    let offer = Arc::new(tokio::sync::Mutex::new(Offer::default()));
     let transfer = TransferServer::start(Arc::clone(&slot), Arc::clone(&offer))?;
     Ok(Box::new(LinuxClipboard {
         slot,
-        last: Arc::new(tokio::sync::Mutex::new(String::new())),
+        last: Arc::new(tokio::sync::Mutex::new(Seen::default())),
         offer,
         change_count: Arc::new(AtomicU64::new(1)),
         watcher: Mutex::new(None),
@@ -145,11 +164,72 @@ pub(crate) fn backend() -> Result<Box<dyn ClipboardBackend>, ClipboardError> {
     portal_backend(Arc::new(PortalClipboardSlot::new()))
 }
 
+#[derive(Clone, Default)]
+struct Offer {
+    text: Option<String>,
+    png: Option<Vec<u8>>,
+    uri_list: Option<String>,
+}
+
+impl Offer {
+    fn is_empty(&self) -> bool {
+        self.text.is_none() && self.png.is_none() && self.uri_list.is_none()
+    }
+
+    fn mime_types(&self) -> Vec<&str> {
+        let mut mimes = Vec::new();
+        if self.text.is_some() {
+            mimes.extend_from_slice(TEXT_MIMES);
+        }
+        if self.png.is_some() {
+            mimes.push(IMAGE_PNG);
+        }
+        if self.uri_list.is_some() {
+            mimes.push(URI_LIST);
+            mimes.push(GNOME_COPIED);
+        }
+        mimes
+    }
+
+    fn payload(&self, mime: &str) -> Option<Vec<u8>> {
+        if mime == TEXT_UTF8 || mime == TEXT_PLAIN {
+            return self.text.as_ref().map(|text| text.as_bytes().to_vec());
+        }
+        if mime == IMAGE_PNG {
+            return self.png.clone();
+        }
+        if mime == URI_LIST {
+            return self.uri_list.as_ref().map(|uris| uris.as_bytes().to_vec());
+        }
+        if mime == GNOME_COPIED {
+            return self.uri_list.as_ref().map(|uris| gnome_copied_files(uris).into_bytes());
+        }
+        None
+    }
+}
+
+#[derive(Clone, Default, PartialEq, Eq)]
+struct Seen {
+    text: String,
+    png: Option<u64>,
+    uris: String,
+}
+
+impl Seen {
+    fn from_selection(text: &str, png: Option<&[u8]>, paths: &[PathBuf]) -> Self {
+        Self {
+            text: text.to_owned(),
+            png: png.map(digest),
+            uris: encode_uri_list(paths),
+        }
+    }
+}
+
 struct LinuxClipboard {
     slot: Arc<PortalClipboardSlot>,
-    last: Arc<tokio::sync::Mutex<String>>,
-    /// Text we currently advertise via `SetSelection`, served on `SelectionTransfer`.
-    offer: Arc<tokio::sync::Mutex<Option<String>>>,
+    last: Arc<tokio::sync::Mutex<Seen>>,
+    /// Content we currently advertise via `SetSelection`, served on `SelectionTransfer`.
+    offer: Arc<tokio::sync::Mutex<Offer>>,
     change_count: Arc<AtomicU64>,
     watcher: Mutex<Option<Watcher>>,
     /// Serves `SelectionTransfer` for our `SetSelection` even when watch is off.
@@ -158,27 +238,35 @@ struct LinuxClipboard {
 }
 
 impl LinuxClipboard {
-    async fn read_text_async(&self) -> Result<String, ClipboardError> {
+    async fn read_selection_async(&self) -> Result<(String, Option<Vec<u8>>, Vec<PathBuf>), ClipboardError> {
         let bound = self.slot.get()?;
-        read_plain_text(&bound.clipboard, bound.session.as_ref()).await
+        read_selection(&bound.clipboard, bound.session.as_ref()).await
     }
 
-    async fn write_text_async(&self, text: &str) -> Result<u64, ClipboardError> {
+    async fn publish_async(&self, offer: Offer) -> Result<u64, ClipboardError> {
+        if offer.is_empty() {
+            return Err(ClipboardError::Unsupported);
+        }
         let bound = self.slot.get()?;
+        let mimes = offer.mime_types();
         {
-            let mut offer = self.offer.lock().await;
-            *offer = Some(text.to_owned());
+            let mut slot = self.offer.lock().await;
+            *slot = offer.clone();
         }
         bound
             .clipboard
             .set_selection(
                 bound.session.as_ref(),
-                SetSelectionOptions::default().set_mime_types(TEXT_MIMES),
+                SetSelectionOptions::default().set_mime_types(&mimes),
             )
             .await
             .map_err(|e| ClipboardError::Platform(format!("SetSelection：{e}")))?;
         let mut last = self.last.lock().await;
-        text.clone_into(&mut *last);
+        *last = Seen {
+            text: offer.text.clone().unwrap_or_default(),
+            png: offer.png.as_deref().map(digest),
+            uris: offer.uri_list.clone().unwrap_or_default(),
+        };
         Ok(self.change_count.fetch_add(1, Ordering::AcqRel) + 1)
     }
 }
@@ -193,6 +281,12 @@ fn session_key(session: &Session<RemoteDesktop>) -> Vec<u8> {
 
 fn same_session(bound: &Bound, event: &Session<RemoteDesktop>) -> bool {
     !bound.session_key.is_empty() && bound.session_key == session_key(event)
+}
+
+fn digest(bytes: &[u8]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Successful empty read is `Ok("")`. Every MIME failing is `Err` (do not treat as clear).
@@ -210,21 +304,58 @@ fn text_from_selection_reads(results: &[Result<Vec<u8>, String>]) -> Result<Stri
     )))
 }
 
+async fn selection_read_bytes(
+    clipboard: &Clipboard,
+    session: &Session<RemoteDesktop>,
+    mime: &str,
+) -> Result<Vec<u8>, String> {
+    match clipboard.selection_read(session, mime).await {
+        Ok(fd) => read_all_fd(fd).map_err(|error| error.to_string()),
+        Err(error) => {
+            tracing::trace!(%error, mime, "SelectionRead mime unavailable");
+            Err(error.to_string())
+        }
+    }
+}
+
 async fn read_plain_text(clipboard: &Clipboard, session: &Session<RemoteDesktop>) -> Result<String, ClipboardError> {
     let mut results = Vec::with_capacity(TEXT_MIMES.len());
     for mime in TEXT_MIMES {
-        match clipboard.selection_read(session, mime).await {
-            Ok(fd) => match read_all_fd(fd) {
-                Ok(bytes) => results.push(Ok(bytes)),
-                Err(error) => results.push(Err(error.to_string())),
-            },
-            Err(error) => {
-                tracing::trace!(%error, mime, "SelectionRead mime unavailable");
-                results.push(Err(error.to_string()));
-            }
-        }
+        results.push(selection_read_bytes(clipboard, session, mime).await);
     }
     text_from_selection_reads(&results)
+}
+
+async fn read_selection(
+    clipboard: &Clipboard,
+    session: &Session<RemoteDesktop>,
+) -> Result<(String, Option<Vec<u8>>, Vec<PathBuf>), ClipboardError> {
+    let text_result = read_plain_text(clipboard, session).await;
+    let png = match selection_read_bytes(clipboard, session, IMAGE_PNG).await {
+        Ok(bytes) if bytes.starts_with(PNG_MAGIC) => Some(bytes),
+        _ => None,
+    };
+    let paths = read_file_paths(clipboard, session).await;
+    match text_result {
+        Ok(text) => Ok((text, png, paths)),
+        // Image/file-only pasteboards have no text MIME; keep those usable.
+        Err(_) if png.is_some() || !paths.is_empty() => Ok((String::new(), png, paths)),
+        // Text-only read failure must not look like an empty clipboard.
+        Err(error) => Err(error),
+    }
+}
+
+async fn read_file_paths(clipboard: &Clipboard, session: &Session<RemoteDesktop>) -> Vec<PathBuf> {
+    if let Ok(bytes) = selection_read_bytes(clipboard, session, URI_LIST).await {
+        let paths = parse_uri_list(&bytes);
+        if !paths.is_empty() {
+            return paths;
+        }
+    }
+    if let Ok(bytes) = selection_read_bytes(clipboard, session, GNOME_COPIED).await {
+        return parse_gnome_copied(&bytes);
+    }
+    Vec::new()
 }
 
 fn read_all_fd(fd: zbus::wire::OwnedFd) -> io::Result<Vec<u8>> {
@@ -247,16 +378,366 @@ fn decode_text(bytes: &[u8]) -> Result<String, ClipboardError> {
     Ok(text.trim_end_matches('\0').to_owned())
 }
 
+fn interesting_mimes(mimes: &[String]) -> bool {
+    mimes.iter().any(|mime| {
+        mime.starts_with("text/plain")
+            || mime.eq_ignore_ascii_case(IMAGE_PNG)
+            || mime.eq_ignore_ascii_case(URI_LIST)
+            || mime.eq_ignore_ascii_case(GNOME_COPIED)
+    })
+}
+
+fn is_top_level(entry: &FileEntry) -> bool {
+    !entry.path.contains('/')
+}
+
+fn is_png_encoding(format: &NativeFormat) -> bool {
+    match format {
+        NativeFormat::Mac(name) => name == "public.png",
+        NativeFormat::WindowsRegistered(name) => {
+            name.eq_ignore_ascii_case("PNG")
+                || name.split(';').next().is_some_and(|mime| {
+                    matches!(mime.trim().to_ascii_lowercase().as_str(), "image/png" | "image/x-png")
+                })
+        }
+        NativeFormat::Unknown(name) => {
+            let name = name.trim();
+            name.eq_ignore_ascii_case("mime:image/png")
+                || name.eq_ignore_ascii_case("mime:image/x-png")
+                || name.eq_ignore_ascii_case("image/png")
+        }
+        NativeFormat::WindowsPredefined(_) => false,
+    }
+}
+
+fn percent_encode_path_byte(byte: u8, out: &mut String) {
+    match byte {
+        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(byte as char),
+        b'/' => out.push('/'),
+        _ => {
+            use std::fmt::Write as _;
+            let _ = write!(out, "%{byte:02X}");
+        }
+    }
+}
+
+fn file_url(path: &Path) -> Option<String> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut url = String::from("file://");
+    if path.as_os_str().is_empty() {
+        return None;
+    }
+    for component in path.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(part) => {
+                url.push('/');
+                for byte in part.as_encoded_bytes() {
+                    percent_encode_path_byte(*byte, &mut url);
+                }
+            }
+            Component::CurDir | Component::ParentDir | Component::Prefix(_) => return None,
+        }
+    }
+    if url == "file://" {
+        url.push('/');
+    }
+    Some(url)
+}
+
+fn file_url_to_path(url: &str) -> Option<PathBuf> {
+    let rest = url.strip_prefix("file://")?;
+    let path_part = if rest.starts_with('/') {
+        rest.to_owned()
+    } else {
+        let (host, path) = rest.split_once('/')?;
+        if !host.is_empty() && !host.eq_ignore_ascii_case("localhost") {
+            return None;
+        }
+        format!("/{path}")
+    };
+    let decoded = percent_decode(&path_part)?;
+    let path = PathBuf::from(decoded);
+    path.is_absolute().then_some(path)
+}
+
+fn percent_decode(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' => {
+                let hex = bytes.get(index + 1..index + 3)?;
+                let value = u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?;
+                out.push(value);
+                index += 3;
+            }
+            byte => {
+                out.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn encode_uri_list(paths: &[PathBuf]) -> String {
+    let mut out = String::new();
+    for path in paths {
+        let Some(url) = file_url(path) else {
+            continue;
+        };
+        out.push_str(&url);
+        out.push_str("\r\n");
+    }
+    out
+}
+
+fn gnome_copied_files(uri_list: &str) -> String {
+    let mut out = String::from("copy\n");
+    for line in uri_list.lines() {
+        let line = line.trim().trim_end_matches('\r');
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+fn parse_uri_list(bytes: &[u8]) -> Vec<PathBuf> {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .map(|line| line.trim().trim_end_matches('\r'))
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(file_url_to_path)
+        .collect()
+}
+
+fn parse_gnome_copied(bytes: &[u8]) -> Vec<PathBuf> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut lines = text.lines().map(|line| line.trim().trim_end_matches('\r'));
+    match lines.next() {
+        Some("copy" | "cut" | "link") => {}
+        Some(first) => {
+            return std::iter::once(first)
+                .chain(lines)
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                .filter_map(file_url_to_path)
+                .collect();
+        }
+        None => return Vec::new(),
+    }
+    lines
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(file_url_to_path)
+        .collect()
+}
+
+fn uri_list_from_entries(entries: &[FileEntry]) -> Result<String, ClipboardError> {
+    let tops: Vec<_> = entries.iter().filter(|entry| is_top_level(entry)).collect();
+    if tops.is_empty() {
+        return Err(ClipboardError::Unsupported);
+    }
+    let paths: Vec<_> = tops.iter().filter_map(|entry| entry.local_path.clone()).collect();
+    if paths.len() != tops.len() {
+        return Err(ClipboardError::FileProviderUnavailable);
+    }
+    let encoded = encode_uri_list(&paths);
+    if encoded.is_empty() {
+        return Err(ClipboardError::Unsupported);
+    }
+    Ok(encoded)
+}
+
+fn local_uri_list(spec: &NativeSpec) -> Result<Option<String>, ClipboardError> {
+    if spec.files.is_empty() {
+        return Ok(None);
+    }
+    // Portal clipboard is MIME+fd only. Callers must materialize first.
+    if spec.file_contents.is_some() {
+        return Err(ClipboardError::FileProviderUnavailable);
+    }
+    Ok(Some(uri_list_from_entries(&spec.files)?))
+}
+
+/// Relative clipboard paths must stay inside the batch directory.
+fn batch_dest(batch: &Path, relative: &str) -> Result<PathBuf, ClipboardError> {
+    if relative
+        .split('/')
+        .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err(ClipboardError::FileProviderUnavailable);
+    }
+    let dest = batch.join(relative);
+    if !dest.starts_with(batch) {
+        return Err(ClipboardError::FileProviderUnavailable);
+    }
+    Ok(dest)
+}
+
+/// Download remote/virtual files into `~/.cache/oink/Received/…` so portal can
+/// advertise ordinary `file://` URIs. Failure leaves the agent free to retry
+/// non-file companions via `FileProviderUnavailable`.
+fn materialize_files(spec: &mut NativeSpec) -> Result<(), ClipboardError> {
+    materialize_files_into(spec, &oink_foundation::paths::cache_dir().join("Received"))
+}
+
+fn materialize_files_into(spec: &mut NativeSpec, root: &Path) -> Result<(), ClipboardError> {
+    if spec.files.is_empty() {
+        return Ok(());
+    }
+    if spec
+        .files
+        .iter()
+        .filter(|entry| is_top_level(entry))
+        .all(|entry| entry.local_path.is_some())
+    {
+        spec.file_contents = None;
+        return Ok(());
+    }
+    let Some(contents) = spec.file_contents.clone() else {
+        return Err(ClipboardError::FileProviderUnavailable);
+    };
+    let entries = match contents.descriptor_entries() {
+        Ok(Some(entries)) if !entries.is_empty() => entries,
+        Ok(_) => spec.files.clone(),
+        Err(error) => return Err(materialize_error(error)),
+    };
+    fs_create_dir_all(root)?;
+    let batch = root.join(format!(
+        "{}-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+        std::process::id()
+    ));
+    fs_create_dir_all(&batch)?;
+    let written = (|| {
+        for (index, entry) in entries.iter().enumerate() {
+            let dest = batch_dest(&batch, &entry.path)?;
+            if entry.is_dir {
+                fs_create_dir_all(&dest)?;
+                continue;
+            }
+            if let Some(parent) = dest.parent() {
+                fs_create_dir_all(parent)?;
+            }
+            let mut reader = contents.open(index).map_err(materialize_error)?;
+            let mut file = std::fs::File::create(&dest).map_err(|error| {
+                ClipboardError::Platform(format!("写入收到的文件失败：{error}"))
+            })?;
+            io::copy(&mut reader, &mut file).map_err(|error| {
+                ClipboardError::Platform(format!("写入收到的文件失败：{error}"))
+            })?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = written {
+        let _ = std::fs::remove_dir_all(&batch);
+        return Err(error);
+    }
+    for entry in &mut spec.files {
+        if is_top_level(entry) {
+            entry.local_path = Some(batch.join(&entry.path));
+        }
+    }
+    spec.file_contents = None;
+    Ok(())
+}
+
+/// Cancel/busy stay distinct; every other materialize failure must look like
+/// missing File Provider so the agent retries text/PNG companions.
+fn materialize_error(error: io::Error) -> ClipboardError {
+    match read_error(error) {
+        ClipboardError::Busy => ClipboardError::Busy,
+        _ => ClipboardError::FileProviderUnavailable,
+    }
+}
+
+fn fs_create_dir_all(path: &Path) -> Result<(), ClipboardError> {
+    std::fs::create_dir_all(path).map_err(|error| ClipboardError::Platform(format!("创建目录失败：{error}")))
+}
+
+fn offer_from_items(items: &[ClipData]) -> Result<Offer, ClipboardError> {
+    let text = items.iter().find_map(|item| match item {
+        ClipData::Text(text) => Some(text.clone()),
+        _ => None,
+    });
+    let png = items.iter().find_map(|item| match item {
+        ClipData::Png(bytes) if bytes.starts_with(PNG_MAGIC) => Some(bytes.clone()),
+        _ => None,
+    });
+    let uri_list = items
+        .iter()
+        .find_map(|item| match item {
+            ClipData::Files(entries) => Some(uri_list_from_entries(entries)),
+            _ => None,
+        })
+        .transpose()?;
+    let offer = Offer { text, png, uri_list };
+    if offer.is_empty() {
+        Err(ClipboardError::Unsupported)
+    } else {
+        Ok(offer)
+    }
+}
+
+fn offer_from_spec(spec: &NativeSpec) -> Result<Offer, ClipboardError> {
+    let uri_list = local_uri_list(spec)?;
+    let text = plain_text(spec).ok();
+    let png = png_bytes(spec).ok();
+    let offer = Offer { text, png, uri_list };
+    if offer.is_empty() {
+        Err(ClipboardError::Unsupported)
+    } else {
+        Ok(offer)
+    }
+}
+
+fn file_entries(paths: &[PathBuf]) -> Vec<FileEntry> {
+    paths
+        .iter()
+        .filter_map(|path| {
+            let meta = std::fs::symlink_metadata(path).ok()?;
+            let name = path.file_name()?.to_str()?.to_owned();
+            Some(FileEntry {
+                path: name,
+                is_dir: meta.is_dir(),
+                size: if meta.is_file() { meta.len() } else { 0 },
+                modified_ms: meta.modified().ok().and_then(|time| {
+                    time.duration_since(std::time::UNIX_EPOCH)
+                        .ok()
+                        .map(|duration| duration.as_millis() as i64)
+                }),
+                local_path: Some(path.clone()),
+            })
+        })
+        .collect()
+}
+
 impl ClipboardBackend for LinuxClipboard {
     fn change_count(&self) -> u64 {
         self.change_count.load(Ordering::Acquire)
     }
 
     fn read(&self) -> Result<ClipSnapshot, ClipboardError> {
-        let text = block_on(self.read_text_async())?;
+        let (text, png, paths) = block_on(self.read_selection_async())?;
         let mut items = Vec::new();
+        let files = file_entries(&paths);
+        if !files.is_empty() {
+            items.push(ClipData::Files(files));
+        }
         if !text.is_empty() {
             items.push(ClipData::Text(text));
+        }
+        if let Some(png) = png {
+            items.push(ClipData::Png(png));
         }
         Ok(ClipSnapshot {
             items,
@@ -267,24 +748,36 @@ impl ClipboardBackend for LinuxClipboard {
 
     fn capture(&self, _data: &std::path::Path) -> Result<crate::CapturedClipboard, ClipboardError> {
         let count = self.change_count();
-        let text = block_on(self.read_text_async())?;
+        let (text, png, paths) = block_on(self.read_selection_async())?;
         if self.change_count() != count {
             return Err(ClipboardError::Busy);
         }
         let slot = Arc::clone(&self.slot);
         let counts = Arc::clone(&self.change_count);
-        let provider = serve_text(count, text, move || {
-            if counts.load(Ordering::Acquire) != count {
-                return Err(content::clipboard::changed());
-            }
-            let bound = slot.get().map_err(|e| io::Error::other(e.to_string()))?;
-            let current = block_on(read_plain_text(&bound.clipboard, bound.session.as_ref()))
-                .map_err(|e| io::Error::other(e.to_string()))?;
-            if counts.load(Ordering::Acquire) != count {
-                return Err(content::clipboard::changed());
-            }
-            Ok(current)
-        })
+        let expected_text = text.clone();
+        let expected_png = png.clone();
+        let provider = serve_selection(
+            count,
+            text,
+            png,
+            paths,
+            move || {
+                if counts.load(Ordering::Acquire) != count {
+                    return Err(content::clipboard::changed());
+                }
+                let bound = slot.get().map_err(|e| io::Error::other(e.to_string()))?;
+                let (current_text, current_png, _) =
+                    block_on(read_selection(&bound.clipboard, bound.session.as_ref()))
+                        .map_err(|e| io::Error::other(e.to_string()))?;
+                if counts.load(Ordering::Acquire) != count {
+                    return Err(content::clipboard::changed());
+                }
+                if current_text != expected_text || current_png != expected_png {
+                    return Err(content::clipboard::changed());
+                }
+                Ok((current_text, current_png))
+            },
+        )
         .map_err(|error| ClipboardError::ContentUnavailable(content::reason(&error)))?;
         if self.change_count() != count {
             return Err(ClipboardError::Busy);
@@ -301,14 +794,8 @@ impl ClipboardBackend for LinuxClipboard {
 
     fn write(&self, items: &[ClipData], sensitivity: Sensitivity) -> Result<u64, ClipboardError> {
         publishable_sensitivity(sensitivity)?;
-        let text = items.iter().find_map(|item| match item {
-            ClipData::Text(s) => Some(s.as_str()),
-            _ => None,
-        });
-        let Some(text) = text else {
-            return Err(ClipboardError::Unsupported);
-        };
-        block_on(self.write_text_async(text))
+        let offer = offer_from_items(items)?;
+        block_on(self.publish_async(offer))
     }
 
     fn write_native(&self, spec: NativeSpec) -> Result<u64, ClipboardError> {
@@ -321,19 +808,32 @@ impl ClipboardBackend for LinuxClipboard {
 
     fn write_native_cancellable(
         &self,
-        spec: NativeSpec,
+        mut spec: NativeSpec,
         guard: content::ReaderGuard,
         current: content::ReaderGuard,
     ) -> Result<u64, ClipboardError> {
-        // File publication is not implemented. The caller retries the text
-        // companions after this error instead of leaving them unpublished.
-        if !spec.files.is_empty() {
-            return Err(ClipboardError::FileProviderUnavailable);
-        }
         current().map_err(|_| ClipboardError::Busy)?;
-        let text = plain_text(&spec)?;
+        // Materialize virtual files into Received/; if that is impossible, keep
+        // FileProviderUnavailable so the agent can retry text/PNG companions.
+        if let Err(error) = materialize_files(&mut spec) {
+            tracing::warn!(%error, files = spec.files.len(), "linux received materialize failed");
+            return Err(error);
+        }
+        let offer = match offer_from_spec(&spec) {
+            Ok(offer) => offer,
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    files = spec.files.len(),
+                    ?spec.sensitivity,
+                    "linux clipboard publish rejected"
+                );
+                return Err(error);
+            }
+        };
         guard().map_err(|_| ClipboardError::Busy)?;
-        self.write(&[ClipData::Text(text)], spec.sensitivity)
+        publishable_sensitivity(spec.sensitivity)?;
+        block_on(self.publish_async(offer))
     }
 
     fn watch(&self, on_change: ChangeHandler) -> Result<(), ClipboardError> {
@@ -372,7 +872,7 @@ struct Watcher {
 impl Watcher {
     fn start(
         slot: Arc<PortalClipboardSlot>,
-        last: Arc<tokio::sync::Mutex<String>>,
+        last: Arc<tokio::sync::Mutex<Seen>>,
         change_count: Arc<AtomicU64>,
         paused: Arc<AtomicBool>,
         first: ChangeHandler,
@@ -427,10 +927,7 @@ struct TransferServer {
 }
 
 impl TransferServer {
-    fn start(
-        slot: Arc<PortalClipboardSlot>,
-        offer: Arc<tokio::sync::Mutex<Option<String>>>,
-    ) -> Result<Self, ClipboardError> {
+    fn start(slot: Arc<PortalClipboardSlot>, offer: Arc<tokio::sync::Mutex<Offer>>) -> Result<Self, ClipboardError> {
         let stop = Arc::new(AtomicBool::new(false));
         let wake = Arc::new(Notify::new());
         let thread_stop = Arc::clone(&stop);
@@ -461,7 +958,7 @@ impl Drop for TransferServer {
 
 async fn run_watch(
     slot: Arc<PortalClipboardSlot>,
-    last: Arc<tokio::sync::Mutex<String>>,
+    last: Arc<tokio::sync::Mutex<Seen>>,
     stop: Arc<AtomicBool>,
     wake: Arc<Notify>,
     paused: Arc<AtomicBool>,
@@ -515,7 +1012,7 @@ async fn run_watch(
 
 async fn run_transfer(
     slot: Arc<PortalClipboardSlot>,
-    offer: Arc<tokio::sync::Mutex<Option<String>>>,
+    offer: Arc<tokio::sync::Mutex<Offer>>,
     stop: Arc<AtomicBool>,
     wake: Arc<Notify>,
 ) {
@@ -559,7 +1056,7 @@ async fn observe_change(
     clipboard: &Clipboard,
     session: &Session<RemoteDesktop>,
     change: &SelectionOwnerChanged,
-    last: &tokio::sync::Mutex<String>,
+    last: &tokio::sync::Mutex<Seen>,
     change_count: &AtomicU64,
 ) -> bool {
     if change.session_is_owner() == Some(true) {
@@ -568,25 +1065,26 @@ async fn observe_change(
     let mimes = change.mime_types();
     if mimes.is_empty() {
         let mut last = last.lock().await;
-        if last.is_empty() {
+        if *last == Seen::default() {
             return false;
         }
-        last.clear();
+        *last = Seen::default();
         change_count.fetch_add(1, Ordering::AcqRel);
         return true;
     }
-    if !mimes.iter().any(|mime| mime.starts_with("text/plain")) {
+    if !interesting_mimes(mimes) {
         return false;
     }
-    let Ok(text) = read_plain_text(clipboard, session).await else {
+    let Ok((text, png, paths)) = read_selection(clipboard, session).await else {
         // Read failure must not look like an empty clipboard.
         return false;
     };
+    let seen = Seen::from_selection(&text, png.as_deref(), &paths);
     let mut last = last.lock().await;
-    if text == *last {
+    if seen == *last {
         return false;
     }
-    *last = text;
+    *last = seen;
     change_count.fetch_add(1, Ordering::AcqRel);
     true
 }
@@ -596,38 +1094,30 @@ async fn serve_transfer(
     session: &Session<RemoteDesktop>,
     mime: &str,
     serial: u32,
-    offer: &tokio::sync::Mutex<Option<String>>,
+    offer: &tokio::sync::Mutex<Offer>,
 ) {
-    let text = offer.lock().await.clone();
-    let Some(text) = text else {
+    let payload = offer.lock().await.payload(mime);
+    let Some(bytes) = payload else {
         let _ = clipboard.selection_write_done(session, serial, false).await;
         return;
     };
-    if mime != TEXT_UTF8 && mime != TEXT_PLAIN {
-        let _ = clipboard.selection_write_done(session, serial, false).await;
-        return;
-    }
     let Ok(fd) = clipboard.selection_write(session, serial).await else {
         let _ = clipboard.selection_write_done(session, serial, false).await;
         return;
     };
-    let ok = write_all_fd(fd, text.as_bytes()).is_ok();
+    let ok = write_all_fd(fd, &bytes).is_ok();
     let _ = clipboard.selection_write_done(session, serial, ok).await;
 }
 
-struct Utf8Text;
-impl Translator for Utf8Text {
+struct PortalTranslator;
+impl Translator for PortalTranslator {
     fn standard(&self, representation: &Representation, bytes: &[u8]) -> io::Result<Vec<ClipData>> {
-        if representation.standard != Some(StandardFormat::Text) {
-            return Err(content::unavailable(Unavailable::Unsupported));
-        }
-        let text = String::from_utf8(bytes.to_vec()).map_err(|_| content::unavailable(Unavailable::InvalidData))?;
-        Ok(vec![ClipData::Text(text)])
+        content::decode_standard(representation, bytes)
     }
 }
 
-fn text_inventory(count: u64, text: &str) -> crate::model::Inventory {
-    let mut inventory = crate::model::Inventory {
+fn empty_inventory(count: u64) -> crate::model::Inventory {
+    crate::model::Inventory {
         id: OfferId {
             clip: ClipId {
                 origin: DeviceId([0; 32]),
@@ -638,63 +1128,120 @@ fn text_inventory(count: u64, text: &str) -> crate::model::Inventory {
         platform: ClipPlatform::Unknown,
         items: Vec::new(),
         roots: Vec::new(),
-    };
-    if text.is_empty() {
-        return inventory;
     }
-    inventory.items.push(ContentItem {
-        id: ItemId(1),
-        virtual_files: false,
-        file: None,
-        representations: vec![Representation {
-            id: RepresentationId(1),
-            format: NativeFormat::Unknown("mime:text/plain;charset=utf-8".into()),
-            medium: Medium::Bytes,
-            aspect: 1,
-            index: -1,
-            standard: Some(StandardFormat::Text),
-            data: RepresentationData::Reader {
-                size: ContentSize::Known(text.len() as u64),
-            },
-        }],
-    });
+}
+
+fn selection_inventory(count: u64, text: &str, png: Option<&[u8]>) -> crate::model::Inventory {
+    let mut inventory = empty_inventory(count);
+    let mut next_item = 1u32;
+    let mut next_rep = 1u32;
+    if !text.is_empty() {
+        inventory.items.push(ContentItem {
+            id: ItemId(next_item),
+            virtual_files: false,
+            file: None,
+            representations: vec![Representation {
+                id: RepresentationId(next_rep),
+                format: NativeFormat::Unknown("mime:text/plain;charset=utf-8".into()),
+                medium: Medium::Bytes,
+                aspect: 1,
+                index: -1,
+                standard: Some(StandardFormat::Text),
+                data: RepresentationData::Reader {
+                    size: ContentSize::Known(text.len() as u64),
+                },
+            }],
+        });
+        next_item += 1;
+        next_rep += 1;
+    }
+    if let Some(png) = png {
+        inventory.items.push(ContentItem {
+            id: ItemId(next_item),
+            virtual_files: false,
+            file: None,
+            representations: vec![Representation {
+                id: RepresentationId(next_rep),
+                format: NativeFormat::Unknown("mime:image/png".into()),
+                medium: Medium::Bytes,
+                aspect: 1,
+                index: -1,
+                standard: Some(StandardFormat::Png),
+                data: RepresentationData::Reader {
+                    size: ContentSize::Known(png.len() as u64),
+                },
+            }],
+        });
+    }
     inventory
 }
 
-fn serve_text(
+fn serve_selection(
     count: u64,
     text: String,
-    read: impl Fn() -> io::Result<String> + Send + Sync + 'static,
+    png: Option<Vec<u8>>,
+    paths: Vec<PathBuf>,
+    read: impl Fn() -> io::Result<(String, Option<Vec<u8>>)> + Send + Sync + 'static,
 ) -> io::Result<Arc<dyn Provider>> {
-    let inventory = text_inventory(count, &text);
-    let expected = text;
+    let inventory = selection_inventory(count, &text, png.as_deref());
+    let text_id = inventory
+        .items
+        .iter()
+        .find(|item| item.representations.iter().any(|rep| rep.standard == Some(StandardFormat::Text)))
+        .and_then(|item| item.representations.first().map(|rep| rep.id));
+    let png_id = inventory
+        .items
+        .iter()
+        .find(|item| item.representations.iter().any(|rep| rep.standard == Some(StandardFormat::Png)))
+        .and_then(|item| item.representations.first().map(|rep| rep.id));
+    let expected_text = text;
+    let expected_png = png;
+    let files = if paths.is_empty() {
+        None
+    } else {
+        let roots = paths
+            .into_iter()
+            .enumerate()
+            .map(|(index, path)| (NodeId(index as u64 + 1), path))
+            .collect();
+        Some(content::namespace::Local::clipboard(roots)? as Arc<dyn content::namespace::Namespace>)
+    };
     let provider = content::clipboard::Clipboard::new(
         inventory,
         Box::new(move |id| {
-            if id != RepresentationId(1) {
-                return Err(content::unavailable(Unavailable::NoSuchItem));
+            let (current_text, current_png) = read()?;
+            if Some(id) == text_id {
+                if current_text != expected_text {
+                    return Err(content::clipboard::changed());
+                }
+                return Ok(Box::new(std::io::Cursor::new(current_text.into_bytes())));
             }
-            let current = read()?;
-            if current != expected {
-                return Err(content::clipboard::changed());
+            if Some(id) == png_id {
+                let Some(bytes) = current_png else {
+                    return Err(content::clipboard::changed());
+                };
+                if Some(&bytes) != expected_png.as_ref() {
+                    return Err(content::clipboard::changed());
+                }
+                return Ok(Box::new(std::io::Cursor::new(bytes)));
             }
-            Ok(Box::new(std::io::Cursor::new(current.into_bytes())))
+            Err(content::unavailable(Unavailable::NoSuchItem))
         }),
         Arc::new(|| Ok(())),
-        Arc::new(Utf8Text),
-        None,
+        Arc::new(PortalTranslator),
+        files,
     )?;
     Ok(provider)
 }
 
-/// Portal SetSelection cannot mark Concealed/Transient/AutoGenerated.
-/// Writing them as plain text would land secrets in history — fail closed.
+/// Portal SetSelection cannot mark sensitivity. Concealed stays fail-closed so
+/// secrets are not dropped into ordinary clipboard history. Transient /
+/// AutoGenerated (screenshots, etc.) still publish — otherwise Linux never
+/// receives the most common image copies.
 fn publishable_sensitivity(sensitivity: Sensitivity) -> Result<(), ClipboardError> {
     match sensitivity {
-        Sensitivity::Normal => Ok(()),
-        Sensitivity::Concealed | Sensitivity::Transient | Sensitivity::AutoGenerated => {
-            Err(ClipboardError::Unsupported)
-        }
+        Sensitivity::Normal | Sensitivity::Transient | Sensitivity::AutoGenerated => Ok(()),
+        Sensitivity::Concealed => Err(ClipboardError::Unsupported),
     }
 }
 
@@ -743,6 +1290,84 @@ fn plain_text(spec: &NativeSpec) -> Result<String, ClipboardError> {
     })
 }
 
+fn is_windows_dib(format: &NativeFormat) -> bool {
+    match format {
+        NativeFormat::WindowsPredefined(CF_DIB) | NativeFormat::WindowsPredefined(CF_DIBV5) => true,
+        NativeFormat::WindowsRegistered(name) => {
+            name.eq_ignore_ascii_case("Dib") || name.eq_ignore_ascii_case("DeviceIndependentBitmap")
+        }
+        _ => false,
+    }
+}
+
+fn png_bytes(spec: &NativeSpec) -> Result<Vec<u8>, ClipboardError> {
+    let target = crate::reconstruction_target();
+    let mut candidates: Vec<&Representation> = spec
+        .inventory
+        .wanted(target)
+        .filter(|representation| representation.standard == Some(StandardFormat::Png))
+        .filter(|representation| {
+            !matches!(
+                representation.data,
+                RepresentationData::Unavailable(_) | RepresentationData::File(_) | RepresentationData::Promise(..)
+            )
+        })
+        .collect();
+    if candidates.is_empty() {
+        return Err(ClipboardError::Unsupported);
+    }
+    // Prefer already-encoded PNG; fall back to CF_DIB / CF_DIBV5 conversion.
+    candidates.sort_by_key(|representation| {
+        (
+            !is_png_encoding(&representation.format),
+            !is_windows_dib(&representation.format),
+        )
+    });
+    let mut saw = false;
+    let mut last_error = None;
+    for representation in candidates {
+        saw = true;
+        let dib = is_windows_dib(&representation.format);
+        if spec.inventory.platform == ClipPlatform::Windows
+            && !is_png_encoding(&representation.format)
+            && !dib
+        {
+            continue;
+        }
+        let mut reader = match spec.contents.open(representation.id) {
+            Ok(reader) => reader,
+            Err(error) => {
+                last_error = Some(read_error(error));
+                continue;
+            }
+        };
+        let bytes = match content::read_all(&mut reader) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                last_error = Some(read_error(error));
+                continue;
+            }
+        };
+        if bytes.starts_with(PNG_MAGIC) {
+            return Ok(bytes);
+        }
+        if dib {
+            match windows_image::dib_to_png(&bytes) {
+                Ok(png) => return Ok(png),
+                Err(error) => {
+                    last_error = Some(ClipboardError::ContentUnavailable(error.reason()));
+                    continue;
+                }
+            }
+        }
+    }
+    Err(last_error.unwrap_or(if saw {
+        ClipboardError::ContentUnavailable(Unavailable::InvalidData)
+    } else {
+        ClipboardError::Unsupported
+    }))
+}
+
 fn read_error(error: io::Error) -> ClipboardError {
     let reason = content::reason(&error);
     if matches!(reason, Unavailable::Cancelled | Unavailable::Superseded) {
@@ -770,9 +1395,19 @@ fn decode_windows_unicode(bytes: &[u8]) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn tiny_png() -> Vec<u8> {
+        // 1x1 transparent PNG.
+        vec![
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, 0x00,
+            0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00,
+            0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01,
+            0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ]
+    }
+
     #[test]
     fn text_offer_is_portable_utf8_for_mac_and_windows() {
-        let provider = serve_text(3, "你好".into(), || Ok("你好".into())).unwrap();
+        let provider = serve_selection(3, "你好".into(), None, Vec::new(), || Ok(("你好".into(), None))).unwrap();
         let inventory = provider.inventory();
         assert!(inventory.validate().is_ok());
         for target in [ClipPlatform::Mac, ClipPlatform::Windows] {
@@ -784,8 +1419,26 @@ mod tests {
     }
 
     #[test]
+    fn png_offer_is_portable_for_mac_and_windows() {
+        let png = tiny_png();
+        let provider = serve_selection(4, String::new(), Some(png.clone()), Vec::new(), {
+            let png = png.clone();
+            move || Ok((String::new(), Some(png.clone())))
+        })
+        .unwrap();
+        let inventory = provider.inventory();
+        assert!(inventory.validate().is_ok());
+        for target in [ClipPlatform::Mac, ClipPlatform::Windows] {
+            let representation = inventory.wanted(target).next().expect("png");
+            assert_eq!(representation.standard, Some(StandardFormat::Png));
+            let mut reader = content::open_for(provider.as_ref(), representation.id, target).unwrap();
+            assert_eq!(content::read_all(&mut reader).unwrap(), png);
+        }
+    }
+
+    #[test]
     fn empty_clipboard_has_no_items() {
-        let provider = serve_text(1, String::new(), || Ok(String::new())).unwrap();
+        let provider = serve_selection(1, String::new(), None, Vec::new(), || Ok((String::new(), None))).unwrap();
         assert!(provider.inventory().items.is_empty());
         assert!(provider.inventory().validate().is_ok());
     }
@@ -798,18 +1451,14 @@ mod tests {
     }
 
     #[test]
-    fn non_normal_sensitivity_is_not_publishable() {
+    fn only_concealed_sensitivity_is_rejected() {
         assert!(publishable_sensitivity(Sensitivity::Normal).is_ok());
-        for sensitivity in [
-            Sensitivity::Concealed,
-            Sensitivity::Transient,
-            Sensitivity::AutoGenerated,
-        ] {
-            assert!(matches!(
-                publishable_sensitivity(sensitivity),
-                Err(ClipboardError::Unsupported)
-            ));
-        }
+        assert!(publishable_sensitivity(Sensitivity::Transient).is_ok());
+        assert!(publishable_sensitivity(Sensitivity::AutoGenerated).is_ok());
+        assert!(matches!(
+            publishable_sensitivity(Sensitivity::Concealed),
+            Err(ClipboardError::Unsupported)
+        ));
     }
 
     struct BytesOffer {
@@ -831,7 +1480,7 @@ mod tests {
         }
 
         fn translator(&self) -> Arc<dyn Translator> {
-            Arc::new(Utf8Text)
+            Arc::new(PortalTranslator)
         }
     }
 
@@ -856,6 +1505,43 @@ mod tests {
                     aspect: 1,
                     index: -1,
                     standard: Some(StandardFormat::Text),
+                    data: RepresentationData::Reader {
+                        size: ContentSize::Known(bytes.len() as u64),
+                    },
+                }],
+            }],
+            roots: Vec::new(),
+        };
+        NativeSpec {
+            inventory: inventory.clone(),
+            contents: Arc::new(BytesOffer { inventory, bytes }),
+            files: Vec::new(),
+            file_contents: None,
+            sensitivity: Sensitivity::Normal,
+        }
+    }
+
+    fn png_spec(platform: ClipPlatform, format: NativeFormat, bytes: Vec<u8>) -> NativeSpec {
+        let inventory = crate::model::Inventory {
+            id: OfferId {
+                clip: ClipId {
+                    origin: DeviceId([0; 32]),
+                    seq: 1,
+                },
+                generation: 1,
+            },
+            platform,
+            items: vec![ContentItem {
+                id: ItemId(1),
+                file: None,
+                virtual_files: false,
+                representations: vec![Representation {
+                    id: RepresentationId(1),
+                    format,
+                    medium: Medium::Bytes,
+                    aspect: 1,
+                    index: -1,
+                    standard: Some(StandardFormat::Png),
                     data: RepresentationData::Reader {
                         size: ContentSize::Known(bytes.len() as u64),
                     },
@@ -916,6 +1602,102 @@ mod tests {
     }
 
     #[test]
+    fn png_bytes_accepts_portable_and_native_png_encodings() {
+        let png = tiny_png();
+        let portable = png_spec(
+            ClipPlatform::Mac,
+            NativeFormat::Unknown("mime:image/png".into()),
+            png.clone(),
+        );
+        assert_eq!(png_bytes(&portable).unwrap(), png);
+
+        let win_png = png_spec(
+            ClipPlatform::Windows,
+            NativeFormat::WindowsRegistered("PNG".into()),
+            png.clone(),
+        );
+        assert_eq!(png_bytes(&win_png).unwrap(), png);
+
+        let bad_dib = png_spec(
+            ClipPlatform::Windows,
+            NativeFormat::WindowsPredefined(CF_DIB),
+            b"BM not a png".to_vec(),
+        );
+        assert!(matches!(
+            png_bytes(&bad_dib),
+            Err(ClipboardError::ContentUnavailable(Unavailable::InvalidData))
+        ));
+
+        // Minimal 1×1 BI_RGB 24-bit bottom-up DIB (BITMAPINFOHEADER + BGR pixel + pad).
+        let mut dib = vec![
+            40, 0, 0, 0, // biSize
+            1, 0, 0, 0, // biWidth
+            1, 0, 0, 0, // biHeight
+            1, 0, // biPlanes
+            24, 0, // biBitCount
+            0, 0, 0, 0, // BI_RGB
+            4, 0, 0, 0, // biSizeImage
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        dib.extend_from_slice(&[0x10, 0x20, 0x30, 0x00]); // BGR + pad
+        let from_dib = png_spec(
+            ClipPlatform::Windows,
+            NativeFormat::WindowsPredefined(CF_DIB),
+            dib,
+        );
+        let converted = png_bytes(&from_dib).unwrap();
+        assert!(converted.starts_with(PNG_MAGIC));
+    }
+
+    #[test]
+    fn file_url_roundtrip_encodes_spaces() {
+        let path = PathBuf::from("/tmp/hello world.png");
+        let url = file_url(&path).unwrap();
+        assert_eq!(url, "file:///tmp/hello%20world.png");
+        assert_eq!(file_url_to_path(&url), Some(path));
+    }
+
+    #[test]
+    fn uri_list_and_gnome_formats_parse_paths() {
+        let list = "file:///tmp/a\r\n# comment\r\nfile:///tmp/b\r\n";
+        assert_eq!(
+            parse_uri_list(list.as_bytes()),
+            vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")]
+        );
+        let gnome = "copy\nfile:///tmp/a\nfile:///tmp/b\n";
+        assert_eq!(
+            parse_gnome_copied(gnome.as_bytes()),
+            vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")]
+        );
+        assert_eq!(
+            gnome_copied_files(list),
+            "copy\nfile:///tmp/a\nfile:///tmp/b\n"
+        );
+    }
+
+    #[test]
+    fn offer_from_items_requires_local_paths_for_files() {
+        let ready = offer_from_items(&[ClipData::Files(vec![FileEntry {
+            path: "a.txt".into(),
+            is_dir: false,
+            size: 1,
+            modified_ms: None,
+            local_path: Some(PathBuf::from("/tmp/a.txt")),
+        }])])
+        .unwrap();
+        assert!(ready.uri_list.unwrap().contains("file:///tmp/a.txt"));
+
+        let missing = offer_from_items(&[ClipData::Files(vec![FileEntry {
+            path: "a.txt".into(),
+            is_dir: false,
+            size: 1,
+            modified_ms: None,
+            local_path: None,
+        }])]);
+        assert!(matches!(missing, Err(ClipboardError::FileProviderUnavailable)));
+    }
+
+    #[test]
     fn unbound_slot_rejects_read() {
         let backend = portal_backend(Arc::new(PortalClipboardSlot::new())).unwrap();
         assert!(matches!(backend.read(), Err(ClipboardError::Platform(_))));
@@ -929,6 +1711,149 @@ mod tests {
         assert_eq!(
             text_from_selection_reads(&[Err("x".into()), Ok(b"hi".to_vec())]).unwrap(),
             "hi"
+        );
+    }
+
+    #[test]
+    fn interesting_mimes_include_png_and_files() {
+        assert!(interesting_mimes(&["image/png".into()]));
+        assert!(interesting_mimes(&["text/uri-list".into()]));
+        assert!(interesting_mimes(&["x-special/gnome-copied-files".into()]));
+        assert!(!interesting_mimes(&["text/html".into()]));
+    }
+
+    #[test]
+    fn batch_dest_rejects_traversal() {
+        let batch = PathBuf::from("/tmp/oink-batch");
+        assert!(batch_dest(&batch, "a.txt").is_ok());
+        assert!(batch_dest(&batch, "dir/a.txt").is_ok());
+        assert!(matches!(
+            batch_dest(&batch, "../escape"),
+            Err(ClipboardError::FileProviderUnavailable)
+        ));
+        assert!(matches!(
+            batch_dest(&batch, "a/../../escape"),
+            Err(ClipboardError::FileProviderUnavailable)
+        ));
+    }
+
+    struct MemoryFiles {
+        entries: Vec<FileEntry>,
+        bodies: Vec<Vec<u8>>,
+        fail_at: Option<usize>,
+    }
+
+    impl crate::FileContents for MemoryFiles {
+        fn descriptor_entries(&self) -> io::Result<Option<Vec<FileEntry>>> {
+            Ok(Some(self.entries.clone()))
+        }
+
+        fn open(&self, index: usize) -> io::Result<crate::FileReader> {
+            if self.fail_at == Some(index) {
+                return Err(io::Error::other("forced open failure"));
+            }
+            let bytes = self
+                .bodies
+                .get(index)
+                .cloned()
+                .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+            Ok(Box::new(std::io::Cursor::new(bytes)))
+        }
+    }
+
+    fn file_spec(entries: Vec<FileEntry>, bodies: Vec<Vec<u8>>, fail_at: Option<usize>) -> NativeSpec {
+        let inventory = empty_inventory(1);
+        NativeSpec {
+            inventory: inventory.clone(),
+            contents: Arc::new(BytesOffer {
+                inventory,
+                bytes: Vec::new(),
+            }),
+            files: entries
+                .iter()
+                .filter(|entry| is_top_level(entry))
+                .cloned()
+                .collect(),
+            file_contents: Some(Arc::new(MemoryFiles {
+                entries,
+                bodies,
+                fail_at,
+            })),
+            sensitivity: Sensitivity::Normal,
+        }
+    }
+
+    #[test]
+    fn materialize_files_sets_local_paths_under_batch() {
+        let root = tempfile::tempdir().unwrap();
+        let mut spec = file_spec(
+            vec![
+                FileEntry {
+                    path: "a.txt".into(),
+                    is_dir: false,
+                    size: 3,
+                    modified_ms: None,
+                    local_path: None,
+                },
+                FileEntry {
+                    path: "dir".into(),
+                    is_dir: true,
+                    size: 0,
+                    modified_ms: None,
+                    local_path: None,
+                },
+                FileEntry {
+                    path: "dir/b.txt".into(),
+                    is_dir: false,
+                    size: 3,
+                    modified_ms: None,
+                    local_path: None,
+                },
+            ],
+            vec![b"aaa".to_vec(), Vec::new(), b"bbb".to_vec()],
+            None,
+        );
+        materialize_files_into(&mut spec, root.path()).unwrap();
+        assert!(spec.file_contents.is_none());
+        let a = spec.files.iter().find(|e| e.path == "a.txt").unwrap();
+        let dir = spec.files.iter().find(|e| e.path == "dir").unwrap();
+        let a_path = a.local_path.as_ref().unwrap();
+        let dir_path = dir.local_path.as_ref().unwrap();
+        assert!(a_path.starts_with(root.path()));
+        assert!(dir_path.starts_with(root.path()));
+        assert_eq!(std::fs::read(a_path).unwrap(), b"aaa");
+        assert_eq!(std::fs::read(dir_path.join("b.txt")).unwrap(), b"bbb");
+    }
+
+    #[test]
+    fn materialize_files_removes_batch_when_open_fails() {
+        let root = tempfile::tempdir().unwrap();
+        let mut spec = file_spec(
+            vec![
+                FileEntry {
+                    path: "a.txt".into(),
+                    is_dir: false,
+                    size: 1,
+                    modified_ms: None,
+                    local_path: None,
+                },
+                FileEntry {
+                    path: "b.txt".into(),
+                    is_dir: false,
+                    size: 1,
+                    modified_ms: None,
+                    local_path: None,
+                },
+            ],
+            vec![b"a".to_vec(), b"b".to_vec()],
+            Some(1),
+        );
+        let err = materialize_files_into(&mut spec, root.path()).unwrap_err();
+        assert!(matches!(err, ClipboardError::FileProviderUnavailable));
+        assert!(spec.files.iter().all(|entry| entry.local_path.is_none()));
+        assert!(
+            std::fs::read_dir(root.path()).unwrap().next().is_none(),
+            "failed batch must be deleted"
         );
     }
 }

@@ -276,7 +276,11 @@ pub fn usage() -> io::Result<Usage> {
     {
         crate::windows::cloud::received_usage()
     }
-    #[cfg(not(any(target_os = "macos", windows)))]
+    #[cfg(target_os = "linux")]
+    {
+        linux_usage()
+    }
+    #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
     {
         Err(io::ErrorKind::Unsupported.into())
     }
@@ -290,10 +294,83 @@ pub fn open() -> io::Result<()> {
     {
         crate::windows::cloud::open_received()
     }
-    #[cfg(not(any(target_os = "macos", windows)))]
+    #[cfg(target_os = "linux")]
+    {
+        linux_open()
+    }
+    #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
     {
         Err(io::ErrorKind::Unsupported.into())
     }
+}
+
+/// Linux has no File Provider / Cloud Files root. Keep a plain Received folder
+/// under the cache root so Settings › 管理 can open something real.
+#[cfg(target_os = "linux")]
+fn received_root() -> PathBuf {
+    oink_foundation::paths::cache_dir().join("Received")
+}
+
+/// Delete batch dirs older than `days`. Batch names start with receive-time
+/// millis (`{millis}-{pid}`); mtime is the fallback.
+#[cfg(target_os = "linux")]
+fn linux_purge(root: &Path, days: u64) {
+    if days == 0 || !root.exists() {
+        return;
+    }
+    let cutoff = now().saturating_sub(days * DAY);
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let from_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.split('-').next())
+            .and_then(|stamp| stamp.parse::<u64>().ok());
+        let from_mtime = entry
+            .metadata()
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_millis() as u64);
+        let received_at = from_name.or(from_mtime).unwrap_or(u64::MAX);
+        if received_at <= cutoff {
+            let _ = fs::remove_dir_all(&path);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_usage() -> io::Result<Usage> {
+    let root = received_root();
+    linux_purge(&root, setting().days());
+    let mut usage = Usage {
+        time_basis: Basis::Received,
+        cleanup: setting(),
+        ..Default::default()
+    };
+    if !root.exists() {
+        return Ok(usage);
+    }
+    match crate::cache::tree_bytes(&root) {
+        Ok(bytes) => usage.materialized_bytes = bytes,
+        Err(_) => usage.incomplete = true,
+    }
+    Ok(usage)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_open() -> io::Result<()> {
+    let root = received_root();
+    fs::create_dir_all(&root)?;
+    // Same fire-and-forget pattern as Windows explorer.exe: do not wait on the
+    // file manager process, which may stay alive for the whole session.
+    std::process::Command::new("xdg-open").arg(&root).spawn().map(|_| ())
 }
 
 fn normalized_name(value: &str) -> String {
@@ -348,6 +425,37 @@ pub(crate) fn apply_exec_bits(file: &std::fs::File, bits: Option<u16>) -> io::Re
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_usage_reports_empty_root_without_creating_it() {
+        let root = received_root();
+        let existed = root.exists();
+        let usage = linux_usage().unwrap();
+        assert_eq!(usage.time_basis, Basis::Received);
+        assert_eq!(usage.cleanup, setting());
+        if !existed {
+            assert!(!root.exists(), "usage must not create the Received folder");
+            assert_eq!(usage.materialized_bytes, 0);
+            assert!(!usage.incomplete);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_purge_removes_batches_past_cleanup_age() {
+        let root = tempfile::tempdir().unwrap();
+        let old = root.path().join(format!("{}-1", now().saturating_sub(8 * DAY)));
+        let fresh = root.path().join(format!("{}-2", now()));
+        fs::create_dir_all(&old).unwrap();
+        fs::write(old.join("a.txt"), b"x").unwrap();
+        fs::create_dir_all(&fresh).unwrap();
+        fs::write(fresh.join("b.txt"), b"y").unwrap();
+        linux_purge(root.path(), 7);
+        assert!(!old.exists(), "aged batch must be removed");
+        assert!(fresh.exists(), "fresh batch must stay");
+        linux_purge(root.path(), 0);
+        assert!(fresh.exists(), "Never must not delete");
+    }
     #[test]
     fn app_and_unknown_survive_cache_expiry_but_explicit_age_overrides() {
         let mut item = Item::new(100);

@@ -69,13 +69,17 @@ impl Namespace for Remote {
         }
     }
     fn native_open(&self, node: NodeId, offset: u64) -> Option<io::Result<FileReader>> {
-        Some((|| {
-            self.active_files()?;
-            if matches!(*self.0.demand.lock().unwrap(), Demand::Drop(_)) {
-                self.start_delivery();
-            }
-            self.files()?.native()?.open(node, offset)
-        })())
+        match self.files().and_then(|files| files.native()) {
+            Ok(native) => Some((|| {
+                self.active_files()?;
+                if matches!(*self.0.demand.lock().unwrap(), Demand::Drop(_)) {
+                    self.start_delivery();
+                }
+                native.open(node, offset)
+            })()),
+            // No File Provider / Cloud Files binder yet (Linux): use wire open.
+            Err(_) => None,
+        }
     }
     fn native_metadata(&self, node: NodeId) -> Option<io::Result<crate::FileMetadata>> {
         match self.files().and_then(|files| files.native()) {
